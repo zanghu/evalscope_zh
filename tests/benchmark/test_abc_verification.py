@@ -66,6 +66,21 @@ def test_replay_overlays_trusted_files_without_touching_candidate(tmp_path: Path
     assert (Path(result.artifact_dir) / 'verification.json').exists()
 
 
+@pytest.mark.parametrize('status,expected', [('error', None), ('timed_out', 0)])
+def test_development_error_is_not_scored_as_budget_exhaustion(
+    tmp_path: Path, status: str, expected: int | None,
+) -> None:
+    root, candidate = tmp_path / 'case', tmp_path / 'candidate'
+    manifest, execution = fixture(root, candidate)
+    execution.status = status
+    execution.error = 'Model not found' if status == 'error' else 'Agent budget exhausted'
+    result = verify(root, manifest, execution, tmp_path / 'output')
+    assert result.resolved == expected
+    assert result.status == ('needs_review' if status == 'error' else 'budget_exceeded')
+    assert result.stages == []
+    assert execution.error in result.reason
+
+
 @pytest.mark.parametrize('problem', ['hash', 'version', 'tamper'])
 def test_replay_rejects_bad_inputs_and_changed_trusted_files(tmp_path: Path, problem: str) -> None:
     root, candidate = tmp_path / 'case', tmp_path / 'candidate'

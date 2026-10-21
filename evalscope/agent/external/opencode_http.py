@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .opencode_events import OpenCodeEventMonitor
+
 
 class OpenCodeHTTPConfig(BaseModel):
     """Server connection and per-attempt execution policy."""
@@ -28,6 +30,8 @@ class OpenCodeHTTPConfig(BaseModel):
     poll_interval: float = Field(default=1, gt=0)
     startup_timeout: float = Field(default=30, gt=0)
     session_timeout: float = Field(default=120, gt=0)
+    event_connect_timeout: float = Field(default=10, gt=0)
+    prompt_start_timeout: float = Field(default=120, gt=0)
     abort_timeout: float = Field(default=15, gt=0)
     password_env: str = 'OPENCODE_SERVER_PASSWORD'
     username: str = 'opencode'
@@ -46,6 +50,16 @@ class OpenCodeHTTPConfig(BaseModel):
         return self
 
 
+class OpenCodeRunDiagnostics(BaseModel):
+    """Evidence distinguishing execution failures from monitoring failures."""
+
+    error_source: str | None = None
+    prompt_accepted: bool = False
+    assistant_seen: bool = False
+    last_session_status: str | None = None
+    last_poll_error: str | None = None
+
+
 class OpenCodeOutcome(BaseModel):
     """A stopped session's execution outcome, not a correctness verdict."""
 
@@ -54,6 +68,7 @@ class OpenCodeOutcome(BaseModel):
     server_version: str = ''
     messages: list[dict[str, Any]] = Field(default_factory=list)
     error: str | None = None
+    diagnostics: OpenCodeRunDiagnostics = Field(default_factory=OpenCodeRunDiagnostics)
 
 
 class OpenCodeHTTPClient:
@@ -85,6 +100,25 @@ class OpenCodeHTTPClient:
         if result.get('healthy') is not True:
             raise RuntimeError('OpenCode health check failed.')
         return result
+
+    def _event_monitor(self, directory: str, session_id: str) -> OpenCodeEventMonitor:
+        password = os.environ.get(self.config.password_env)
+        return OpenCodeEventMonitor(
+            self.config.base_url,
+            directory,
+            session_id,
+            (self.config.username, password) if password else None,
+            self.config.event_connect_timeout,
+        )
+
+    @staticmethod
+    def _monitor_failed(monitor: OpenCodeEventMonitor, result: OpenCodeOutcome) -> bool:
+        error, failure = monitor.snapshot()
+        if not error and not failure:
+            return False
+        result.error = error or failure
+        result.diagnostics.error_source = 'session.error' if error else 'event_stream'
+        return True
 
     def _abort(self, session_id: str, directory: str) -> bool:
         try:
@@ -118,38 +152,88 @@ class OpenCodeHTTPClient:
             'model': {'providerID': self.config.provider_id, 'modelID': self.config.model_id},
             'parts': [{'type': 'text', 'text': instruction}],
         }
-        deadline = time.monotonic() + self.config.timeout
+        monitor = self._event_monitor(directory_text, session_id)
+        idle_since: float | None = None
+        idle_polls = 0
         try:
             actual_directory = Path(session.get('directory', directory_text)).resolve()
             if actual_directory != directory.resolve():
                 raise ValueError('OpenCode session directory does not match the requested workspace.')
+            monitor.start()
+            last_poll_at = time.monotonic()
+            deadline = last_poll_at + self.config.timeout
+
+            def poll(path: str) -> Any:
+                remaining = max(0.001, deadline - time.monotonic())
+                return self.request(
+                    'GET',
+                    path,
+                    directory_text,
+                    timeout=min(self.config.request_timeout, remaining),
+                )
+
             try:
                 # 2. 下达任务
-                self.request('POST', f'/session/{session_id}/prompt_async', directory_text, json=prompt)
+                self.request(
+                    'POST',
+                    f'/session/{session_id}/prompt_async',
+                    directory_text,
+                    json=prompt,
+                    timeout=min(self.config.request_timeout, self.config.timeout),
+                )
             except httpx.TransportError:
                 # Delivery is unknown. Poll by message ID instead of sending twice.
                 pass
             while time.monotonic() < deadline:
+                if self._monitor_failed(monitor, result):
+                    return self._stop(result, directory_text)
                 try:
-                    messages = self.request('GET', f'/session/{session_id}/message', directory_text)
+                    messages = poll(f'/session/{session_id}/message')
                     result.messages = messages
-                    states = self.request('GET', '/session/status', directory_text)
+                    states = poll('/session/status')
                     for endpoint in ('/permission', '/question'):
-                        pending = self.request('GET', endpoint, directory_text)
+                        pending = poll(endpoint)
                         if any(item.get('sessionID') == session_id for item in pending):
                             result.status = 'needs_input'
                             result.error = f'Pending {endpoint[1:]} request; no automatic approval.'
                             return self._stop(result, directory_text)
+                    if self._monitor_failed(monitor, result):
+                        return self._stop(result, directory_text)
+                    last_poll_at = time.monotonic()
                     accepted = any(m['info'].get('id') == message_id for m in messages)
                     replies = [
                         m
                         for m in messages
                         if m['info'].get('role') == 'assistant' and m['info'].get('parentID') == message_id
                     ]
+                    diagnostics = result.diagnostics
+                    diagnostics.prompt_accepted = diagnostics.prompt_accepted or accepted
+                    diagnostics.assistant_seen = diagnostics.assistant_seen or bool(replies)
+                    diagnostics.last_session_status = states.get(session_id, {}).get('type', 'idle')
+                    diagnostics.last_poll_error = None
+                    idle = diagnostics.last_session_status == 'idle'
+                    if idle and not diagnostics.assistant_seen:
+                        idle_since = idle_since if idle_since is not None else time.monotonic()
+                        idle_polls += 1
+                    else:
+                        idle_since, idle_polls = None, 0
+                    if (
+                        idle_since is not None
+                        and idle_polls >= 2
+                        and time.monotonic() - idle_since >= self.config.prompt_start_timeout
+                    ):
+                        diagnostics.error_source = 'prompt_start'
+                        result.error = (
+                            'Prompt accepted, but no assistant reply or execution progress was observed while idle.'
+                            if diagnostics.prompt_accepted
+                            else 'Prompt delivery could not be confirmed; session remained idle. Prompt was not resent.'
+                        )
+                        return self._stop(result, directory_text)
                     if replies:
                         latest = replies[-1]
                         info = latest['info']
                         if info.get('error'):
+                            diagnostics.error_source = 'assistant.error'
                             result.error = str(info['error'])
                             return self._stop(result, directory_text)
                         pending_tools = any(
@@ -166,13 +250,27 @@ class OpenCodeHTTPClient:
                         if accepted and finished and idle and not pending_tools:
                             result.status = 'completed'
                             return result
-                except httpx.TransportError:
-                    pass
-                time.sleep(self.config.poll_interval)
+                except httpx.TransportError as exc:
+                    idle_since, idle_polls = None, 0
+                    result.diagnostics.last_poll_error = f'{type(exc).__name__}: {exc}'
+                    if time.monotonic() - last_poll_at >= self.config.prompt_start_timeout:
+                        result.diagnostics.error_source = 'polling'
+                        result.error = f'Execution monitoring unavailable: {result.diagnostics.last_poll_error}'
+                        return self._stop(result, directory_text)
+                monitor.wait(min(self.config.poll_interval, max(0, deadline - time.monotonic())))
+            if self._monitor_failed(monitor, result):
+                return self._stop(result, directory_text)
+            if result.diagnostics.last_poll_error:
+                result.diagnostics.error_source = 'polling'
+                result.error = f'Unable to confirm execution state: {result.diagnostics.last_poll_error}'
+                return self._stop(result, directory_text)
             result.status = 'timed_out'
             result.error = 'Agent budget exhausted (or prompt delivery could not be confirmed).'
-        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        except (httpx.HTTPError, ValueError, KeyError, TypeError, RuntimeError) as exc:
             result.error = f'{type(exc).__name__}: {exc}'
+            self._monitor_failed(monitor, result)
+        finally:
+            monitor.close()
         return self._stop(result, directory_text)
 
     def _stop(self, result: OpenCodeOutcome, directory: str) -> OpenCodeOutcome:
