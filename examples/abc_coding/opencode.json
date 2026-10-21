@@ -1,0 +1,36 @@
+{
+  "model": "deepseek-v4-flash-opencode",
+  "eval_type": "mock_llm",
+  "datasets": ["abc_coding"],
+  "dataset_args": {
+    "abc_coding": {
+      "local_path": "E:/custom_benchmark/evalscope_cases",
+      "extra_params": {
+        "opencode": {
+          "base_url": "http://127.0.0.1:41960",
+          "start_server": true,
+          "executable": "opencode",
+          "provider_id": "deepseek",
+          "model_id": "deepseek-v4-flash",
+          "timeout": 1800,
+          "permissions": [
+            {"permission": "*", "pattern": "*", "action": "ask"},
+            {"permission": "read", "pattern": "*", "action": "allow"},
+            {"permission": "list", "pattern": "*", "action": "allow"},
+            {"permission": "glob", "pattern": "*", "action": "allow"},
+            {"permission": "grep", "pattern": "*", "action": "allow"},
+            {"permission": "edit", "pattern": "*", "action": "allow"},
+            {"permission": "bash", "pattern": "*", "action": "allow"},
+            {"permission": "todowrite", "pattern": "*", "action": "allow"},
+            {"permission": "external_directory", "pattern": "*", "action": "deny"}
+          ]
+        }
+      }
+    }
+  },
+  "eval_batch_size": 1,
+  "work_dir": "E:/custom_benchmark/runs",
+  "ignore_errors": false,
+  "collect_perf": false,
+  "analysis_report": false
+}

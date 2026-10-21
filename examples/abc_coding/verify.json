@@ -1,0 +1,25 @@
+{
+  "model": "deepseek-v4-flash-opencode",
+  "eval_type": "mock_llm",
+  "datasets": [
+    "abc_coding"
+  ],
+  "dataset_args": {
+    "abc_coding": {
+      "local_path": "E:/custom_benchmark/evalscope_cases",
+      "extra_params": {
+        "coding": {
+          "mode": "verify_only",
+          "candidates": {
+            "litemall-pr534": "E:\\custom_benchmark\\runs\\20260918_120507\\artifacts\\abc_coding\\litemall-pr534\\38be58c9b0594a59a0b24f4cd136459f"
+          }
+        }
+      }
+    }
+  },
+  "eval_batch_size": 1,
+  "work_dir": "E:/custom_benchmark/runs",
+  "ignore_errors": false,
+  "collect_perf": false,
+  "analysis_report": false
+}

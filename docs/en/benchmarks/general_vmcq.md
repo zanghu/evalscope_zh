@@ -1,0 +1,94 @@
+# General-VMCQ
+
+
+## Overview
+
+General-VMCQ is a customizable visual multiple-choice question answering benchmark for multimodal models.
+It uses MMMU-style format with image/video/audio placeholders in text, supporting flexible media inputs.
+
+## Task Description
+
+- **Task Type**: Visual Multiple-Choice Question Answering
+- **Input**: Question with `<image N>`/`<video N>`/`<audio N>` placeholders + choice options + media
+- **Output**: Selected answer choice
+- **Flexibility**: Supports custom datasets via local files
+
+## Key Features
+
+- MMMU-style format (not OpenAI message format), supporting up to 100 images/videos/audios per sample
+- Flexible image/video/audio input (path, URL, base64 data URL, or Hugging Face media columns with `{"path": ...}` or `{"bytes": ...}`)
+- Additional format support for `images`/`videos`/`audios` column for unlimited list of media
+- Chain-of-thought prompt template option
+- Custom dataset support via local file loading
+
+## Evaluation Notes
+
+- Default configuration uses **0-shot** evaluation
+- Primary metric: **Accuracy**
+- Train split: **dev**, Eval split: **val**
+- Raw media bytes require parquet; plaintext files carry paths, URLs, or base64 data URLs
+- See [User Guide](https://evalscope.readthedocs.io/en/latest/advanced_guides/custom_dataset/vlm.html) for dataset format
+
+
+## Properties
+
+| Property | Value |
+|----------|-------|
+| **Benchmark Name** | `general_vmcq` |
+| **Dataset ID** | `general_vmcq` |
+| **Paper** | N/A |
+| **Tags** | `Custom`, `MCQ`, `MultiModal` |
+| **Metrics** | `accuracy` |
+| **Default Shots** | 0-shot |
+| **Evaluation Split** | `val` |
+| **Train Split** | `dev` |
+
+
+## Data Statistics
+
+*Statistics not available.*
+
+## Sample Example
+
+*Sample example not available.*
+
+## Prompt Template
+
+**Prompt Template:**
+```text
+Answer the following multiple choice question. The last line of your response should be of the following format: 'ANSWER: [LETTER]' (without quotes) where [LETTER] is one of {letters}. Think step by step before answering.
+
+{question}
+
+{choices}
+```
+
+## Usage
+
+### Using CLI
+
+```bash
+evalscope eval \
+    --model YOUR_MODEL \
+    --api-url OPENAI_API_COMPAT_URL \
+    --api-key EMPTY_TOKEN \
+    --datasets general_vmcq \
+    --limit 10  # Remove this line for formal evaluation
+```
+
+### Using Python
+
+```python
+from evalscope import run_task
+from evalscope.config import TaskConfig
+
+task_cfg = TaskConfig(
+    model='YOUR_MODEL',
+    api_url='OPENAI_API_COMPAT_URL',
+    api_key='EMPTY_TOKEN',
+    datasets=['general_vmcq'],
+    limit=10,  # Remove this line for formal evaluation
+)
+
+run_task(task_cfg=task_cfg)
+```

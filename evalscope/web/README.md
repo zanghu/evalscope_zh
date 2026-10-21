@@ -1,0 +1,146 @@
+# EvalScope Web Dashboard
+
+React + TypeScript + Vite frontend for EvalScope, served by `evalscope service`.
+
+## Design system
+
+All visual decisions live in [DESIGN.md](../../DESIGN.md) at the repo root. Code MUST express styling
+through the token + atom layer there — never through hex literals, inline hex-tinted shadows, or
+hand-written eyebrow class strings.
+
+### Signature atoms (`src/components/ui/`)
+
+| Import | Purpose | DESIGN.md ref |
+|---|---|---|
+| `import ScoreBadge from '@/components/ui/ScoreBadge'` | Bold percentage / boolean pill | `{components.score-badge}` |
+| `import KpiStrip from '@/components/ui/KpiStrip'` | Page-opening counter strip (`hero` / `dense` / `inline` densities) | `{components.kpi-strip}` |
+| `import Eyebrow from '@/components/ui/Eyebrow'` | UPPERCASE section eyebrow label | `{typography.label-xs}` |
+| `import ChatBubble from '@/components/ui/ChatBubble'` | 5-role chat surface (user / bot / tool / reasoning / system) | `{components.chat-bubble}` |
+| `import EmptyState from '@/components/common/EmptyState'` | Empty / welcome state — 64×64 icon tile + 2 lines | `{components.empty-state}` |
+| `import MarkdownRenderer from '@/components/ui/MarkdownRenderer'` | Markdown + math + syntax-highlighted code | — |
+| `import PathBar from '@/components/ui/PathBar'` | Dashboard "scan this directory" input row | `{components.path-bar}` |
+
+### Typography utility classes (defined in `src/index.css`)
+
+Apply via Tailwind class — these cover every DESIGN.md `{typography.*}` token. Never re-derive
+`text-xs font-semibold uppercase tracking-wider …` by hand, and never re-state a property the
+token already sets (`type-table-xs uppercase tracking-wider text-[var(--text-muted)]` is three
+redundant classes):
+
+| Class | Token |
+|---|---|
+| `.type-display-xl` | `{typography.display-xl}` — 24px / bold / tracking-tight |
+| `.type-title-md` | `{typography.title-md}` — 16px / bold |
+| `.type-body-sm` | `{typography.body-sm}` — 14px / regular |
+| `.type-body-sm-strong` | `{typography.body-sm-strong}` — 14px / medium |
+| `.type-body-xs` | `{typography.body-xs}` — 12px / regular |
+| `.type-label-xs` | `{typography.label-xs}` — 12px / semibold / UPPERCASE / tracking-wider / text-muted |
+| `.type-table-xs` | `{typography.table-xs}` — 12px / semibold / UPPERCASE / tracking-wider / text-muted |
+| `.type-caption-mono` | `{typography.caption-mono}` — 12px / mono / tabular-nums |
+| `.type-code` | `{typography.code}` — 13px / mono |
+| `.type-button-sm` | `{typography.button-sm}` — 12px / medium |
+| `.type-button-md` | `{typography.button-md}` — 14px / medium |
+| `.type-button-lg` | `{typography.button-lg}` — 16px / medium |
+
+### Score color helpers
+
+`scoreColor(s)` / `scoreBg(s)` from `@/utils/colorScale` are the single source for the HSL score
+gradient (`hsl(score × 120, 70%, 45%)`).
+
+### Rules
+
+- No inline `style={{ background: 'var(--xxx)' }}` when a Tailwind class would do.
+- No hand-written hex literals or `rgba(129,109,248,…)` glows — go through `--shadow-glow*`.
+- `text-[var(--text-dim)]` requires an inline `// text-dim allowed` comment per DESIGN.md §Text.
+- Prediction comparison tops out at 3 model slots (`MAX_COMPARE_SLOTS` in `domain/compare/selection.ts`) — adding
+  a 4th brand color violates DESIGN.md §Compare Slots. Run selection and score comparison are unbounded.
+
+### Layering
+
+| Directory | Holds |
+|---|---|
+| `src/domain/` | Pure data logic — no React, DOM, network or clock. Enforced by `no-restricted-imports` in `eslint.config.js`. |
+| `src/components/ui/` | Design-system primitives with no business semantics (Button, Table, Skeleton, MarkdownRenderer, VirtualList…). |
+| `src/components/common/` | Composites that do carry business semantics (`DataTable` reads `MetricSemantics`, `EmptyStateSystem` knows the routes). |
+| `src/components/<feature>/` | Feature components: `chat`, `compare`, `reports`, `perf`, `tasks`, `eval`, `dashboard`, `charts`, `nav`. |
+| `src/pages/` | Route targets only — one file per entry in `App.tsx`. A tab or panel belongs to its feature directory. |
+| `src/hooks/` | Cross-feature React hooks (`useAsyncResource` owns every data read). |
+
+`npm run drift` enforces the mechanical parts of this: undefined `type-*` classes, design-system
+components with no importer, and `pages/` modules the router never renders.
+
+---
+
+## Vite scaffold notes
+
+This project started from the Vite React + TypeScript template:
+
+Currently, two official Vite React plugins are available:
+
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+
+## React Compiler
+
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+
+```js
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+
+      // Remove tseslint.configs.recommended and replace with this
+      tseslint.configs.recommendedTypeChecked,
+      // Alternatively, use this for stricter rules
+      tseslint.configs.strictTypeChecked,
+      // Optionally, add this for stylistic rules
+      tseslint.configs.stylisticTypeChecked,
+
+      // Other configs...
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+```
+
+You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+
+```js
+// eslint.config.js
+import reactX from 'eslint-plugin-react-x'
+import reactDom from 'eslint-plugin-react-dom'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+      // Enable lint rules for React
+      reactX.configs['recommended-typescript'],
+      // Enable lint rules for React DOM
+      reactDom.configs.recommended,
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+```

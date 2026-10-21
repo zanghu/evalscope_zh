@@ -1,0 +1,22 @@
+{
+  "model": "abc-coding-baseline",
+  "eval_type": "mock_llm",
+  "datasets": [
+    "abc_coding"
+  ],
+  "dataset_args": {
+    "abc_coding": {
+      "local_path": "E:/custom_benchmark/evalscope_cases",
+      "extra_params": {
+        "coding": {
+          "mode": "verify_baseline"
+        }
+      }
+    }
+  },
+  "eval_batch_size": 1,
+  "work_dir": "E:/custom_benchmark/runs",
+  "ignore_errors": false,
+  "collect_perf": false,
+  "analysis_report": false
+}

@@ -1,0 +1,155 @@
+# AIR-Bench-Chat
+
+
+## 概述
+
+AIR-Bench Chat 是 [AIR-Bench](https://arxiv.org/abs/2402.07729)（Audio InstRuction Benchmark，ACL 2024 主会）的生成式部分——这是首个面向大音频语言模型（LALMs）的指令遵循基准测试，涵盖**人类语音、自然声音和音乐**。该数据集包含约 2,000 个开放式音频问答对，覆盖语音、声音、音乐及混合音频场景；模型的回答由 GPT-4 评判器根据参考答案进行评分。
+
+## 任务描述
+
+- **任务类型**：开放式音频问答。
+- **输入**：一段音频片段加一个自由形式的问题。
+- **输出**：文本答案，与参考答案进行对比评估。
+- **模态**：音频（人类语音、自然声音、音乐）+ 文本。
+
+## 核心特性
+
+- 包含约 2k 个开放式音频问答对，覆盖语音、声音、音乐及混合音频场景；是 AIR-Bench（ACL 2024）的生成式部分。
+- 官方 `cal_score.py` 将 8 个 Chat 任务聚合为 5 个报告类别：`speech`（`speech_QA`, `speech_dialogue_QA`）、`sound`（`sound_QA`, `sound_generation_QA`）、`music`（`music_QA`, `music_generation_analysis_QA`）、`speech_and_sound`（`speech_and_sound_QA`）、`speech_and_music`（`speech_and_music_QA`）。论文中的 Mixed-audio = mean(speech_and_sound, speech_and_music)。
+- 通过将每个样本判断两次（交换参考答案与模型预测的顺序）并取平均值来消除位置偏差（可通过设置 `extra_params={'do_swap': False}` 禁用此机制，以节省一半评判成本）。
+- 数据托管于 ModelScope（[`evalscope/AIR-Bench-Dataset`](https://modelscope.cn/datasets/evalscope/AIR-Bench-Dataset)），采用 audiofolder + JSON 格式；完整数据集约 49 GB，可通过 `extra_params={'tasks': [...]}` 限制任务范围以进行部分运行。
+
+## 评估说明
+
+- **指标**：`judge_score` 表示模型的平均评判分数；`win_rate` 记录模型严格优于参考答案的频率。
+- 评判 LLM 接收问题、音频的文本描述（`meta_info`）、参考答案（`answer_gt`）和模型回答，并输出两个 `[1, 10]` 范围内的整数分数。由于对话类任务的 `meta_info` 可能超过 4k tokens，请使用支持长上下文的评判模型。
+- 官方排行榜使用 `gpt-4-0125-preview`。若该特定快照不可用，请使用其他可用的 GPT-4 级别评判模型；由于评判模型变更，绝对分数可能与已发表结果存在偏差。
+- 若数据集已下载至本地，可通过 `dataset_args={'air_bench_chat': {'local_path': '/path/to/AIR-Bench-Dataset'}}` 指定路径；本地根目录应包含 `Chat/` 文件夹。
+
+## 属性
+
+| 属性 | 值 |
+|----------|-------|
+| **基准测试名称** | `air_bench_chat` |
+| **数据集ID** | [evalscope/AIR-Bench](https://modelscope.cn/datasets/evalscope/AIR-Bench/summary) |
+| **论文** | [Paper](https://aclanthology.org/2024.acl-long.109/) |
+| **标签** | `Audio`, `InstructionFollowing`, `QA` |
+| **指标** | `judge_score`, `win_rate` |
+| **默认示例数** | 0-shot |
+| **评估划分** | `test` |
+
+
+## 数据统计
+
+| 指标 | 值 |
+|--------|-------|
+| 总样本数 | 2,200 |
+| 提示词长度（平均） | 83.89 字符 |
+| 提示词长度（最小/最大） | 17 / 423 字符 |
+
+**各子集统计信息：**
+
+| 子集 | 样本数 | 提示词平均长度 | 提示词最小长度 | 提示词最大长度 |
+|--------|---------|-------------|------------|------------|
+| `speech_QA` | 400 | 64.33 | 23 | 148 |
+| `speech_dialogue_QA` | 400 | 77.03 | 29 | 206 |
+| `sound_QA` | 400 | 73.29 | 17 | 166 |
+| `sound_generation_QA` | 100 | 222.52 | 130 | 423 |
+| `music_QA` | 400 | 57.54 | 24 | 202 |
+| `music_generation_analysis_QA` | 100 | 267.52 | 148 | 395 |
+| `speech_and_sound_QA` | 200 | 63.98 | 25 | 127 |
+| `speech_and_music_QA` | 200 | 69.37 | 32 | 127 |
+
+**音频统计信息：**
+
+| 指标 | 值 |
+|--------|-------|
+| 音频文件总数 | 2,200 |
+| 每样本音频数量 | 最小: 1, 最大: 1, 平均: 1 |
+| 格式 | mp3, wav |
+
+
+## 样例示例
+
+**子集**: `speech_QA`
+
+```json
+{
+  "input": [
+    {
+      "id": "5781ee73",
+      "content": [
+        {
+          "audio": "/root/.cache/modelscope/hub/datasets/evalscope/AIR-Bench-Dataset/Chat/speech_QA_iemocap/Ses01F_script01_1_M025.wav",
+          "format": "wav"
+        },
+        {
+          "text": "Who is the speaker addressing at the end of the speech?"
+        }
+      ]
+    }
+  ],
+  "target": "The speaker is addressing Mom at the end of the speech.",
+  "id": 0,
+  "group_id": 0,
+  "subset_key": "speech_QA",
+  "metadata": {
+    "uniq_id": 400,
+    "task_name": "speech_QA",
+    "dataset_name": "iemocap",
+    "category": "speech",
+    "meta_info": "{'emotion': 'neutral', 'gender': 'male', 'transcription': \"And then we'll thrash it out with father. Okay Mom? Don't avoid me.\"}",
+    "question": "Who is the speaker addressing at the end of the speech?"
+  }
+}
+```
+
+## 提示模板
+
+**提示模板：**
+```text
+{question}
+```
+
+## 额外参数
+
+| 参数 | 类型 | 默认值 | 描述 |
+|-----------|------|---------|-------------|
+| `tasks` | `list` | `None` | 可选的 Chat 任务名称列表（子集包括 ['music_QA', 'music_generation_analysis_QA', 'sound_QA', 'sound_generation_QA', 'speech_QA', 'speech_and_music_QA', 'speech_and_sound_QA', 'speech_dialogue_QA']）。默认评估所有任务。 |
+| `do_swap` | `bool` | `True` | 若为 True（默认），每个样本会被评判两次（交换参考答案与模型预测的顺序），然后取平均分。禁用此选项可节省一半评判成本，但会引入位置偏差。 |
+
+## 使用方法
+
+### 使用 CLI
+
+```bash
+evalscope eval \
+    --model YOUR_MODEL \
+    --api-url OPENAI_API_COMPAT_URL \
+    --api-key EMPTY_TOKEN \
+    --datasets air_bench_chat \
+    --limit 10  # 正式评估时请删除此行
+```
+
+### 使用 Python
+
+```python
+from evalscope import run_task
+from evalscope.config import TaskConfig
+
+task_cfg = TaskConfig(
+    model='YOUR_MODEL',
+    api_url='OPENAI_API_COMPAT_URL',
+    api_key='EMPTY_TOKEN',
+    datasets=['air_bench_chat'],
+    dataset_args={
+        'air_bench_chat': {
+            # subset_list: ['speech_QA', 'speech_dialogue_QA', 'sound_QA']  # 可选，仅评估指定子集
+            # extra_params: {}  # 使用默认额外参数
+        }
+    },
+    limit=10,  # 正式评估时请删除此行
+)
+
+run_task(task_cfg=task_cfg)
+```

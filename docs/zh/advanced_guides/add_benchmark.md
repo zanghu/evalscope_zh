@@ -1,0 +1,610 @@
+# 👍 贡献基准评测
+
+EvalScope作为[ModelScope](https://modelscope.cn)的官方评测工具，其基准评测功能正在持续优化中！我们诚邀您参考本教程，轻松添加自己的评测基准，并与广大社区成员分享您的贡献。一起助力EvalScope的成长，让我们的工具更加出色！
+
+下面将介绍如何添加**通用文本推理**和**多项选择**两种基准评测，主要包含上传数据集、注册数据集、编写评测任务三个步骤。
+
+## 基础概念
+
+```{tip}
+您可以先跳过本节，直接从[准备基准评测数据集](#1-准备基准评测数据集)开始，遇到不理解的代码后再查看具体的实现。
+```
+
+EvalScope评测流程主要包含以下步骤：
+1. **数据准备**：通过`DataAdapter`加载和预处理数据集。
+2. **任务定义**：通过`TaskConfig`定义评测任务的配置，包括模型、数据集、评估指标等。
+3. **评测执行**：通过`run_task`函数执行评测任务，并输出评测结果。
+
+其中`DataAdapter`是我们需要重点了解的类，它是基准评测的核心组件。
+
+### DataAdapter架构和调用流程
+
+DataAdapter采用Pipeline架构，支持通过钩子方法自定义行为。以`DefaultDataAdapter`为例，完整的评测流程如下：
+
+```
+1. 数据加载阶段
+   load_dataset() 
+   ├── load() 
+   │   ├── load_from_remote() / load_from_disk()
+   │   │   ├── load_subsets()
+   │   │   │   └── load_subset() / load_fewshot_subset()
+   │   │   │       └── record_to_sample() [用户实现]
+   │   │   └── _post_process_samples()
+   │   │       └── process_sample_input()
+   │   │           ├── sample_to_fewshot() [用户实现]
+   │   │           ├── format_fewshot_template() [用户可选实现]
+   │   │           └── format_prompt_template() [用户可选实现]
+   │   └── 返回 DatasetDict
+
+2. 模型推理阶段（每个样本）
+   run_inference()
+   ├── _on_inference_start() [钩子方法]
+   ├── _on_inference() [钩子方法]
+   └── _on_inference_end() [钩子方法]
+       └── 返回 TaskState
+
+3. 指标计算阶段（每个样本）
+   calculate_metrics()
+   ├── filter_prediction()
+   │   └── extract_answer() [用户可选实现]
+   ├── match_score() / score_with_judge_contracts()
+   └── 返回 SampleScore
+
+4. 结果聚合阶段
+   aggregate_scores()
+   └── 返回 List[AggScore]
+
+5. 报告生成阶段
+   generate_report()
+   ├── _on_generate_report() [钩子方法]
+   └── _on_generate_report_end() [钩子方法]
+       └── 返回 Report
+```
+
+### 接入 LLM Judge Benchmark
+
+使用者通过 [Judge 参数](../get_started/parameters.md#judge参数) 中的 typed `judge` 配置启用判别：
+
+```python
+TaskConfig(
+    model='MODEL_UNDER_TEST',
+    datasets=['your_benchmark'],
+    judge={
+        'strategy': 'llm',
+        'models': {'model_id': 'JUDGE_MODEL', 'api_url': 'OPENAI_COMPATIBLE_URL', 'api_key': 'API_KEY'},
+    },
+)
+```
+
+对于 adapter 开发者，judge 的 I/O 统一由 `evalscope.api.judge` 处理；不要在 adapter 中调用 `self.llm_judge.judge()`，也不要自行解析模型回复。
+
+1. 声明 `scoring_policy`：规则评分没有意义时使用 `JUDGE_ONLY`；规则评分仍可用、但 `auto` 应使用 Judge 时使用 `JUDGE_DEFAULT`；`auto` 应保留规则评分时使用 `RULE_DEFAULT`。
+2. 实现 adapter 唯一的入口 `judge_definition(context)`。普通的单 verdict 任务返回带有 Pydantic verdict schema 的 `JudgeDefinition.labels(...)` 或 `JudgeDefinition.numeric(...)`。这些 helper 会追加 JSON 输出要求，并将 prompt、schema 与指标映射保持在同一处。
+3. 对 rubric、多 claim 或分阶段任务，定义 Pydantic verdict schema 和 `OutputContract`，然后返回 `JudgeDefinition.workflow(cases=..., request=..., reduce=...)`。只有工作流需要时才传入 `expand=...`、`fallback=...` 或 `finalize=...`。这些 callback 可以嵌套在 `judge_definition()` 中，也可以作为 adapter 的私有 helper，但必须由返回的 definition 持有，不能再作为 adapter hook 暴露。自定义 request 中应追加 `case.output_contract.instruction()`；仅当官方固定 JSON 要求与 schema 完全一致时才可保留官方格式。通过 `CaseVerdict.metadata` 传递上下文，不要把状态编码到 `case_id`。
+4. 当确定性的规则无需调用模型即可判定样本时，返回 `JudgeDefinition.skip(score, reason='...')`。`reason` 为必填字段，会以 `Score.metadata['judge_skip_reason']` 及 `Score.metadata['judge_skipped'] = True` 保存；Web review 面板会将其标为规则直接判分，而非 LLM verdict。
+5. 添加 scripted judge 测试，覆盖有效 JSON verdict、错误 JSON/自然语言回复和 transport error。无效 Judge 回复会从指标中排除，不会记为 0，executor 也不会自动纠错重试。
+
+executor 负责请求调度、位置交换、重复次数、多 Judge quorum、聚合和 review 诊断；模型 transport 的重试策略由 `generation_config` 负责。
+
+### 核心数据结构
+
+#### 1. Sample对象
+表示单个评测样本，包含输入、目标答案和元数据：
+
+```python
+@dataclass
+class Sample:
+    input: Any                    # 输入内容（问题文本或聊天消息列表）
+    target: str                   # 目标答案（正确答案）
+    choices: Optional[List[str]] = None    # 选择项（多选题使用）
+    subset_key: Optional[str] = None       # 子集划分键（用于按类别分组）
+    metadata: Optional[Dict] = None        # 元数据（推理过程、ID等）
+    tools: Optional[List] = None           # 工具调用信息
+```
+
+#### 2. TaskState对象
+表示单次推理任务的完整状态：
+
+```python
+@dataclass
+class TaskState:
+    model: str                    # 模型名称
+    sample: Sample               # 输入样本
+    messages: List[ChatMessage]  # 聊天消息历史
+    output: ModelOutput          # 模型原始输出
+    completed: bool              # 任务是否完成
+    sample_id: Optional[str] = None      # 样本ID
+    group_id: Optional[str] = None       # 分组ID
+    metadata: Optional[Dict] = None      # 任务元数据
+```
+
+#### 3. ModelOutput对象
+表示模型的原始输出：
+
+```python
+@dataclass
+class ModelOutput:
+    completion: str              # 模型生成的文本
+    message: ChatMessage         # 格式化的聊天消息
+    # 其他模型特定字段...
+```
+
+#### 4. Score对象
+表示单个样本的评分结果：
+
+```python
+class Score(BaseModel):
+    value: Dict[str, int | float | bool] = Field(default_factory=dict)  # 例如 {"accuracy": 1.0}
+    extracted_prediction: Optional[str] = None
+    prediction: Optional[str] = None
+    explanation: Optional[str] = None
+    metadata: Optional[Dict] = Field(default_factory=dict)
+    main_score_name: Optional[str] = None  # 仅用于选择当前样本内的一个值
+```
+
+#### 5. SampleScore对象
+封装单个样本的完整评分信息：
+
+```python
+class SampleScore(BaseModel):
+    score: Score
+    sample_id: Optional[str | int] = None
+    group_id: Optional[str | int] = None
+    sample_metadata: Optional[Dict] = None
+```
+
+#### 6. AggScore对象
+表示聚合后的评分统计：
+
+```python
+class AggScore(BaseModel):
+    score: float = 0.0
+    metric_name: str = ''        # 规范指标概念，例如 "accuracy"
+    aggregation: str = 'identity'
+    dimensions: Dict[str, str | int | float | bool] = Field(default_factory=dict)
+    num: int = 0
+    ids: Optional[List[str | int]] = None
+    metadata: Optional[Dict] = None
+```
+
+#### 7. DatasetDict对象
+管理多个数据集子集：
+
+```python
+class DatasetDict(dict):
+    """数据集字典，键为子集名称，值为Dataset对象"""
+    
+    @classmethod
+    def from_dataset(cls, dataset, subset_list=None, limit=None, repeats=1):
+        """从单个数据集创建多子集数据集字典"""
+        pass
+```
+
+### DataAdapter核心方法详解
+
+基于上述调用流程，以下是需要用户实现或可选重写的关键方法：
+
+#### 必须实现的方法
+
+1. **`record_to_sample(record: Dict[str, Any]) -> Sample`**
+   - **作用**：将原始数据记录转换为标准Sample对象
+   - **输入**：数据集中的原始记录字典
+   - **输出**：标准化的Sample对象
+   - **示例**：
+   ```python
+   def record_to_sample(self, record: Dict[str, Any]) -> Sample:
+       return Sample(
+           input=record['question'],
+           target=record['answer'],
+           metadata={'reasoning': record.get('explanation', '')}
+       )
+   ```
+
+#### 可选实现的方法
+
+2. **`sample_to_fewshot(sample: Sample) -> str`**
+   - **作用**：将样本转换为few-shot示例字符串
+   - **输入**：Sample对象
+   - **输出**：格式化的few-shot示例文本
+   - **调用时机**：构建few-shot提示时
+
+3. **`extract_answer(prediction: str, task_state: TaskState) -> str`**
+   - **作用**：从模型原始输出中提取最终答案
+   - **输入**：模型预测文本和任务状态
+   - **输出**：提取的答案字符串
+   - **调用时机**：计算指标前的答案清理
+
+4. **`format_prompt_template(sample: Sample) -> str`**
+   - **作用**：格式化基础提示模板
+   - **输入**：Sample对象
+   - **输出**：格式化的提示文本
+   - **默认实现**：使用`prompt_template.format(question=sample.input)`
+
+5. **`format_fewshot_template(fewshot: str, sample: Sample) -> str`**
+   - **作用**：格式化包含few-shot的提示模板
+   - **输入**：few-shot示例字符串和Sample对象
+   - **输出**：完整的few-shot提示
+   - **默认实现**：使用`few_shot_prompt_template.format()`
+
+6. **`sample_filter(sample: Sample) -> bool`**
+   - **作用**：过滤数据集样本
+   - **输入**：Sample对象
+   - **输出**：是否保留该样本
+   - **默认实现**：返回True（保留所有样本）
+
+### 钩子方法系统
+
+DataAdapter提供了钩子方法系统，支持在关键节点插入自定义逻辑：
+
+#### 推理阶段钩子
+- **`_on_inference_start(model, sample)`**：推理开始前
+- **`_on_inference(model, sample)`**：执行推理
+- **`_on_inference_end(model, sample, model_output, output_dir)`**：推理结束后
+
+#### 报告生成钩子
+- **`_on_generate_report(scores, model_name)`**：生成报告
+- **`_on_generate_report_end(report, output_dir)`**：报告生成后
+
+### 适配器类型
+
+EvalScope提供了两种主要的适配器基类：
+
+1. **`DefaultDataAdapter`**：通用文本推理任务的基础适配器
+   - 适用于开放式问答、数学推理、代码生成等任务
+   - 需要自定义答案提取逻辑
+
+2. **`MultiChoiceAdapter`**：多项选择任务的专用适配器
+   - 继承自`DefaultDataAdapter`
+   - 内置选择项格式化和答案提取逻辑
+   - 支持单选和多选模式
+
+选择适配器类型的原则：
+- 如果任务涉及从固定选项中选择答案 → 使用`MultiChoiceAdapter`
+- 如果任务需要生成开放式答案 → 使用`DefaultDataAdapter`
+
+## 1. 准备基准评测数据集
+
+您有两种方式准备基准评测数据集：
+
+1. **上传到ModelScope（推荐）**：将数据集上传到ModelScope平台，这样其他用户可以一键加载您的数据集，使用更加便捷，也能让更多用户受益于您的贡献。如需上传到ModelScope，可参考[数据集上传教程](https://www.modelscope.cn/docs/datasets/create)。
+
+2. **本地使用**：您也可以直接使用本地数据集进行评测，适合数据集尚在开发阶段或含有敏感信息的情况。
+
+无论选择哪种方式，请确保数据的格式正确且可被加载。如使用本地数据集，可通过以下代码测试：
+
+```python
+from modelscope import MsDataset
+
+dataset = MsDataset.load("/path/to/your/dataset")  # 替换为你的数据集
+```
+
+## 2. 创建文件结构
+
+首先[Fork EvalScope](https://github.com/modelscope/evalscope/fork) 仓库，即创建一个自己的EvalScope仓库副本，将其clone到本地。
+
+```bash
+git clone https://github.com/your_username/evalscope.git
+cd evalscope
+```
+
+然后，在`evalscope/benchmarks/`目录下添加基准评测，结构如下：
+
+```text
+evalscope/benchmarks/
+├── benchmark_name
+│   ├── __init__.py
+│   ├── benchmark_name_adapter.py
+│   └── ...
+```
+具体到`GSM8K`和`MMLU-Pro`，结构如下：
+
+```text
+evalscope/benchmarks/
+├── gsm8k
+│   ├── __init__.py
+│   ├── gsm8k_adapter.py
+├── mmlu_pro
+│   ├── __init__.py
+│   ├── mmlu_pro_adapter.py
+│   └── ...
+```
+
+## 3. 编写评测逻辑
+
+下面将以**GSM8K**和**MMLU-Pro**为例，分别介绍**通用文本推理**和**多项选择**两种评测任务。
+
+### 通用文本推理
+
+通用文本推理任务通常要求模型对给定问题进行分析和推理，然后生成答案。以GSM8K（数学推理）为例：
+
+我们需要在`gsm8k_adapter.py`中注册`Benchmark`并实现`GSM8KAdapter`类：
+
+```python
+from typing import Any, Dict
+from evalscope.api.benchmark import BenchmarkMeta, DefaultDataAdapter
+from evalscope.api.dataset import Sample
+from evalscope.api.evaluator import TaskState
+from evalscope.api.registry import register_benchmark
+from evalscope.constants import Tags
+
+# 定义提示模板
+PROMPT_TEMPLATE = """
+Solve the following math problem step by step. The last line of your response should be of the form "ANSWER: $ANSWER" (without quotes) where $ANSWER is the answer to the problem.
+
+{question}
+
+Remember to put your answer on its own line at the end in the form "ANSWER: $ANSWER" (without quotes) where $ANSWER is the answer to the problem, and you do not need to use a \\boxed command.
+
+Reasoning:
+""".lstrip()
+
+# 注册基准评测
+@register_benchmark(
+    BenchmarkMeta(
+        name='gsm8k',                          # 基准测试名称
+        pretty_name='GSM8K',                   # 可读名称
+        dataset_id='AI-ModelScope/gsm8k',      # 数据集ID 或 本地路径
+        tags=[Tags.MATH, Tags.REASONING],      # 标签
+        description='GSM8K (Grade School Math 8K) is a dataset of grade school math problems, designed to evaluate the mathematical reasoning abilities of AI models.',
+        subset_list=['main'],                  # 子数据集列表
+        few_shot_num=4,                       # few-shot示例数量
+        train_split='train',                  # 训练集split名称
+        eval_split='test',                    # 评测集split名称
+        metric_list=['accuracy'],             # 规范评估指标
+        prompt_template=PROMPT_TEMPLATE,      # 提示模板
+    )
+)
+class GSM8KAdapter(DefaultDataAdapter):
+    
+    def record_to_sample(self, record: Dict[str, Any]) -> Sample:
+        """将原始数据记录转换为Sample对象"""
+        DELIM = '####'
+        question = record['question']
+        answer = record['answer'].split(DELIM)
+        target = answer.pop().strip()  # 提取最终答案
+        reasoning = DELIM.join(answer)  # 提取推理过程
+        
+        return Sample(
+            input=question,
+            target=target,
+            metadata={'reasoning': reasoning.strip()}
+        )
+    
+    def sample_to_fewshot(self, sample: Sample) -> str:
+        """将样本转换为few-shot示例"""
+        if sample.metadata:
+            return (
+                f'{sample.input}\n\nReasoning:\n' + 
+                f"{sample.metadata['reasoning']}\n\n" + 
+                f'ANSWER: {sample.target}'
+            )
+        else:
+            return ''
+    
+    def extract_answer(self, prediction: str, task_state: TaskState):
+        """从模型预测中提取答案"""
+        from evalscope.filters.extraction import RegexFilter
+        
+        # 使用正则表达式提取数字答案
+        regex = RegexFilter(regex_pattern=r'(-?[0-9.,]{2,})|(-?[0-9]+)', group_select=-1)
+        res = regex(prediction)
+        return res.replace(',', '').replace('+', '').strip().strip('.')
+```
+
+### 多项选择
+
+多项选择任务要求模型从给定选项中选择正确答案。以MMLU-Pro为例，我们需要继承`MultiChoiceAdapter`：
+
+```python
+from typing import Any, Dict
+from evalscope.api.benchmark import BenchmarkMeta, MultiChoiceAdapter
+from evalscope.api.dataset import Sample
+from evalscope.api.registry import register_benchmark
+from evalscope.constants import Tags
+
+# 定义提示模板
+USER_PROMPT_TEMPLATE = """Answer the following multiple choice question. The last line of your response should be of the following format: 'ANSWER: $LETTER' (without quotes) where LETTER is one of {letters}. Think step by step before answering.
+
+Question:
+{question}
+Options:
+{choices}
+""".lstrip()
+
+SUBSET_LIST = [
+    'computer science', 'math', 'chemistry', 'engineering', 'law', 'biology', 
+    'health', 'physics', 'business', 'philosophy', 'economics', 'other', 
+    'psychology', 'history'
+]
+
+@register_benchmark(
+    BenchmarkMeta(
+        name='mmlu_pro',
+        pretty_name='MMLU-Pro',
+        tags=[Tags.MULTIPLE_CHOICE, Tags.KNOWLEDGE],
+        description='MMLU-Pro is a benchmark for evaluating language models on multiple-choice questions across various subjects.',
+        dataset_id='modelscope/MMLU-Pro',
+        subset_list=SUBSET_LIST,
+        metric_list=['accuracy'],
+        few_shot_num=5,
+        train_split='validation',
+        eval_split='test',
+        prompt_template=USER_PROMPT_TEMPLATE,
+    )
+)
+class MMLUProAdapter(MultiChoiceAdapter):
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reformat_subset = True  # 启用子集划分
+    
+    def record_to_sample(self, record: Dict[str, Any]) -> Sample:
+        """将原始数据记录转换为Sample对象"""
+        return Sample(
+            input=record['question'],
+            choices=record['options'],      # 选择项列表
+            target=record['answer'],        # 正确答案（如'A'）
+            subset_key=record['category'].lower(),  # 用于子集划分的key
+            metadata={
+                'cot_content': record['cot_content'],
+                'subject': record['category'].lower(),
+                'question_id': record['question_id'],
+            },
+        )
+    
+    def sample_to_fewshot(self, sample: Sample) -> str:
+        """将样本转换为few-shot示例"""
+        q_str = f"""Question:\n{str(sample.input)}"""
+        options = sample.choices if sample.choices is not None else []
+        
+        # 格式化选择项
+        opt_str_list = []
+        for i, opt in enumerate(options):
+            opt_str_list.append(f"""{chr(65 + i)} {opt}""")
+        opt_str = f"""Options:\n{'\n'.join(opt_str_list)}"""
+        
+        # 处理答案和推理过程
+        ans_str = sample.metadata['cot_content'] if sample.metadata is not None else ''
+        ans_str = ans_str.replace('The answer is', 'ANSWER:')
+        ans_opt = ans_str.split('ANSWER:')[-1].split('.')[0].strip().strip('(').strip(')')
+        ans_str = ans_str.replace(f'ANSWER: ({ans_opt})', f'ANSWER: {ans_opt}')
+        
+        final_str = '\n'.join([q_str, opt_str, ans_str])
+        return final_str
+```
+
+### 关键差异说明
+
+**通用文本推理** vs **多项选择**：
+
+1. **继承的基类**：
+   - 通用文本推理：继承`DefaultDataAdapter`
+   - 多项选择：继承`MultiChoiceAdapter`
+
+2. **Sample对象结构**：
+   - 通用文本推理：主要包含`input`和`target`
+   - 多项选择：额外包含`choices`（选择项列表）
+
+3. **答案提取方法**：
+   - 通用文本推理：需要自定义`extract_answer()`方法
+   - 多项选择：`MultiChoiceAdapter`提供了标准的答案提取逻辑
+
+4. **提示模板**：
+   - 通用文本推理：更注重推理过程的引导
+   - 多项选择：专注于选择项的展示和答案格式
+
+### 指标语义与主指标
+
+报告不会猜测指标的含义。指标如何展示——名称、优化方向、单位、刻度与精度——统一来自
+`evalscope/metrics/semantics/catalog.py` 中的集中目录；每个 benchmark 则声明自己的哪个指标承载结论。
+
+**大多数新 benchmark 无需改动目录。** 复用已有规范指标名（`accuracy`、`f1`、
+`exact_match`、`pass_rate` 等）时，语义已经声明好了：
+
+```python
+metric_list=['accuracy'],
+```
+
+有两种情况值得你添一行：
+
+1. **产出多个指标或同一指标的多个变体时**：明确声明哪个指标身份是主指标。Selector 可以约束
+   aggregation，也可以约束 `k`、`scope`、`threshold` 等结构化维度：
+
+   ```python
+   from evalscope.api.metric.semantics import MetricSelector
+
+   metric_list=['precision', 'recall', 'f1', 'accuracy'],
+   primary_metric=MetricSelector(name='f1', aggregation='mean'),
+   ```
+
+   仅产出一个非 diagnostic 指标身份时，它会被隐式选为主指标；若产出多个，则必须声明 selector，
+   报告生成不会按列表顺序猜测。Selector 必须恰好匹配一个实际产出的指标身份，并且其名称必须在
+   `metric_list` 中声明。
+
+2. **引入新的规范指标名时**：在 `METRIC_DEFINITIONS` 中加一行，引用描述它的基线：
+
+   ```python
+   # evalscope/metrics/semantics/catalog.py
+   METRIC_DEFINITIONS['my_new_score'] = MetricEntry(baseline='quality.accuracy.ratio')
+   ```
+
+各命名层应保持分离：
+
+- `metric_list`、`Score.value` 与自定义 `AggScore.metric_name` 使用 `accuracy` 这类规范名称。
+  少量旧别名会为兼容性自动迁移，但新 Adapter 不应继续增加别名。
+- `AggScore` 分别保存 `metric_name`、`aggregation` 和 `dimensions`。不要把 `mean`、`pass@k`、
+  threshold 或 scope 编码进指标名。
+- Catalog 以规范指标名为键；聚合方式导致的含义差异写入 `AGGREGATION_SEMANTICS`，benchmark
+  特有的同名冲突写入 `BENCHMARK_METRIC_OVERRIDES`。
+- `Score.main_score_name` 在单样本中选取一个值，`BenchmarkMeta.primary_metric` 声明报告级
+  主指标身份，`Report.primary_metric_identity` 持久化该身份。
+
+修改 `primary_metric` 后，应运行 `make docs-update BENCHMARK="<name>" FORCE=1` 刷新自动生成的
+元数据缓存，不要手工编辑 `_meta/*.json`。
+
+未声明的指标会降级为 diagnostic，原样显示数值，不伪造方向与单位，并在日志中给出待补充的目录
+条目。动态变体无需在目录中逐一枚举：`k`、问题类型、threshold、token range 等值应放入结构化
+dimensions，并复用规范指标的语义。
+
+## 4. 运行评测
+
+调试代码，看看是否能正常运行。
+
+**GSM8K示例**：
+```python
+from evalscope import run_task, TaskConfig
+
+task_cfg = TaskConfig(
+    model='Qwen/Qwen2.5-0.5B-Instruct',
+    datasets=['gsm8k'],
+    limit=10,
+    debug=True
+)
+run_task(task_cfg=task_cfg)
+```
+
+**MMLU-Pro示例**：
+```python
+from evalscope import run_task, TaskConfig
+
+task_cfg = TaskConfig(
+    model='Qwen/Qwen2.5-0.5B-Instruct',
+    datasets=['mmlu_pro'],
+    limit=10,
+    dataset_args={'mmlu_pro': {'subset_list': ['computer science', 'math']}},
+    debug=True
+)
+run_task(task_cfg=task_cfg)
+```
+
+输出示例：
+
+```text
++-----------------------+-----------+-----------------+------------------+-------+---------+---------+
+| Model                 | Dataset   | Metric          | Subset           |   Num |   Score | Cat.0   |
++=======================+===========+=================+==================+=======+=========+=========+
+| Qwen2.5-0.5B-Instruct | gsm8k     | Accuracy ↑      | main             |    10 |     30% | default |
++-----------------------+-----------+-----------------+------------------+-------+---------+---------+
+| Qwen2.5-0.5B-Instruct | mmlu_pro  | Accuracy ↑      | computer science |    10 |     10% | default |
++-----------------------+-----------+-----------------+------------------+-------+---------+---------+
+| Qwen2.5-0.5B-Instruct | mmlu_pro  | Accuracy ↑      | math             |    10 |     10% | default |
++-----------------------+-----------+-----------------+------------------+-------+---------+---------+
+```
+
+## 5. 基准评测文档生成
+
+完成基准评测实现后，您可以使用EvalScope提供的工具生成标准文档。这将确保您的基准评测有一致的文档格式，并能够被其他用户轻松理解和使用。
+
+要生成中英文文档，请运行以下命令，将根据注册信息生成文档：
+
+```bash
+pip install -e '.[docs]'
+make docs
+```
+
+## 6. 提交PR
+完成实现和文档生成后，请在提交 [PR](https://github.com/modelscope/evalscope/pulls) 前运行仓库的全部检查。该命令会先应用 Ruff 的安全修复和格式化，再验证其余 hooks：
+```bash
+make lint
+```
+检查通过后即可提交评审。完整开发流程请参考[贡献指南](https://github.com/modelscope/evalscope/blob/main/CONTRIBUTING.md)，快来试一试吧🚀

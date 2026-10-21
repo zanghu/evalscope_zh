@@ -1,0 +1,1078 @@
+"""T2 Environment Abstraction – unit and integration tests.
+
+Test plan:
+  TestEnvironmentRegistry      – registry API surface (environments + tools)
+  TestLocalEnvironmentExec     – LocalAgentEnvironment exec
+  TestLocalEnvironmentTools    – bash/python_exec handlers w/ local env
+  TestDockerEnvironmentExec    – EnclaveAgentEnvironment (docker engine) exec
+  TestDockerEnvironmentTools   – bash + python_exec handlers w/ enclave env
+  TestAgentLoopWithEnvironment – full AgentLoop + local env + bash tool
+  TestDefaultAdapterEnvPath    – _on_agent_inference runtime config + tool_infos
+  TestNativeAgentEnvironmentConfig – legacy-compatible Agent environment config
+"""
+
+import os
+import sys
+import tempfile
+import time
+import types
+from typing import Any, Dict, List, Optional
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+import evalscope  # noqa: F401 – trigger strategy / env / tool registration
+from evalscope.api.agent import (
+    AgentContext,
+    AgentEnvironment,
+    AgentLoop,
+    AgentTrace,
+    EventType,
+    ExecResult,
+    ToolExecutor,
+)
+from evalscope.api.agent.types import NativeAgentConfig
+from evalscope.api.messages import ChatMessageAssistant, ChatMessageUser
+from evalscope.api.model.model_output import ChatCompletionChoice, ModelOutput
+from evalscope.api.registry import (
+    AGENT_TOOL_INFO_REGISTRY,
+    ENVIRONMENT_REGISTRY,
+    get_environment,
+    list_agent_tools,
+    list_environments,
+    resolve_tool_infos,
+    resolve_tools,
+)
+from evalscope.api.tool import ToolCall, ToolInfo
+from evalscope.api.tool.tool_call import ToolFunction
+from evalscope.config import TaskConfig
+from evalscope.utils.asyncio_runtime import AsyncioLoopRunner
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_output(content: str, tool_calls=None, stop_reason='stop') -> ModelOutput:
+    msg = ChatMessageAssistant(content=content, tool_calls=tool_calls or [])
+    choice = ChatCompletionChoice(message=msg, finish_reason=stop_reason)
+    return ModelOutput(model='mock', choices=[choice])
+
+
+def _tool_call(name: str, args: Dict[str, Any], call_id: str = 'tc-1') -> ToolCall:
+    return ToolCall(id=call_id, function=ToolFunction(name=name, arguments=args))
+
+
+def _check_docker() -> bool:
+    """Return True if Docker daemon is reachable."""
+    try:
+        import docker  # type: ignore[import]
+        docker.from_env().ping()
+        return True
+    except Exception:
+        return False
+
+
+DOCKER_AVAILABLE = _check_docker()
+docker_mark = pytest.mark.skipif(not DOCKER_AVAILABLE, reason='Docker daemon not available')
+
+
+class _FakeExecutionStatus:
+    SUCCESS = 'success'
+    TIMEOUT = 'timeout'
+
+
+class _FakeSandboxHandle:
+    sandbox_id = 'fake-sandbox'
+
+    def __init__(self) -> None:
+        self.tool_name: Optional[str] = None
+        self.payload: Optional[Dict[str, Any]] = None
+        self.closed = False
+
+    async def execute_tool(self, tool_name: str, payload: Dict[str, Any]) -> Any:
+        self.tool_name = tool_name
+        self.payload = payload
+        return types.SimpleNamespace(
+            output='ok',
+            error='',
+            status=_FakeExecutionStatus.SUCCESS,
+            execution_time=0.1,
+        )
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _install_fake_ms_enclave(monkeypatch: pytest.MonkeyPatch) -> None:
+    ms_enclave_mod = types.ModuleType('ms_enclave')
+    sandbox_mod = types.ModuleType('ms_enclave.sandbox')
+    model_mod = types.ModuleType('ms_enclave.sandbox.model')
+    model_mod.ExecutionStatus = _FakeExecutionStatus
+    sandbox_mod.model = model_mod
+    ms_enclave_mod.sandbox = sandbox_mod
+    monkeypatch.setitem(sys.modules, 'ms_enclave', ms_enclave_mod)
+    monkeypatch.setitem(sys.modules, 'ms_enclave.sandbox', sandbox_mod)
+    monkeypatch.setitem(sys.modules, 'ms_enclave.sandbox.model', model_mod)
+
+
+def _allow_enclave_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+    from evalscope.agent.environments import enclave as enclave_mod
+    monkeypatch.setattr(enclave_mod, 'check_import', lambda *args, **kwargs: None)
+
+
+# ===========================================================================
+# TestEnvironmentRegistry
+# ===========================================================================
+
+class TestEnvironmentRegistry:
+
+    def test_environments_registered(self):
+        envs = list_environments()
+        assert 'local' in envs, f"'local' not in {envs}"
+        assert 'docker' in envs, f"'docker' not in {envs}"
+
+    def test_tools_registered(self):
+        tools = list_agent_tools()
+        for name in ('bash', 'python_exec'):
+            assert name in tools, f"'{name}' not in {tools}"
+
+    def test_tool_infos_registered(self):
+        for name in ('bash', 'python_exec'):
+            assert name in AGENT_TOOL_INFO_REGISTRY, f"ToolInfo missing for '{name}'"
+            info = AGENT_TOOL_INFO_REGISTRY[name]
+            assert isinstance(info, ToolInfo)
+            assert info.name == name
+            assert info.description
+
+    def test_resolve_tool_infos_returns_infos(self):
+        infos = resolve_tool_infos(['bash', 'python_exec'])
+        assert len(infos) == 2
+        assert {i.name for i in infos} == {'bash', 'python_exec'}
+
+    def test_resolve_tool_infos_empty(self):
+        assert resolve_tool_infos(None) == []
+        assert resolve_tool_infos([]) == []
+
+    def test_resolve_tool_infos_unknown_skipped(self):
+        # Unknown names are silently skipped (they have no registered ToolInfo).
+        infos = resolve_tool_infos(['bash', 'nonexistent_tool_xyz'])
+        assert len(infos) == 1
+        assert infos[0].name == 'bash'
+
+    def test_get_runtime_local(self):
+        cls = get_environment('local')
+        from evalscope.agent.environments.local import LocalAgentEnvironment
+        assert cls is LocalAgentEnvironment
+
+    def test_get_runtime_docker(self):
+        cls = get_environment('docker')
+        from evalscope.agent.environments.enclave import EnclaveAgentEnvironment
+        assert cls is EnclaveAgentEnvironment
+
+    def test_get_runtime_enclave_alias(self):
+        from evalscope.agent.environments.enclave import EnclaveAgentEnvironment
+        assert get_environment('enclave') is EnclaveAgentEnvironment
+        assert get_environment('volcengine') is EnclaveAgentEnvironment
+
+    def test_get_runtime_unknown_raises(self):
+        with pytest.raises(ValueError, match='not registered'):
+            get_environment('nonexistent_env_xyz')
+
+    def test_duplicate_environment_registration_raises(self):
+        from evalscope.api.registry import register_environment
+        with pytest.raises(ValueError, match='already registered'):
+            @register_environment('local')
+            class _Dup(AgentEnvironment):
+                async def exec(self, *a, **kw): ...
+                async def close(self): ...
+
+    def test_bash_tool_info_has_required_params(self):
+        info = AGENT_TOOL_INFO_REGISTRY['bash']
+        assert 'command' in info.parameters.properties
+        assert 'command' in info.parameters.required
+
+    def test_python_exec_tool_info_has_required_params(self):
+        info = AGENT_TOOL_INFO_REGISTRY['python_exec']
+        assert 'code' in info.parameters.properties
+        assert 'code' in info.parameters.required
+
+
+# ===========================================================================
+# TestEnclaveEnvironmentInterpreter
+# ===========================================================================
+
+class TestEnclaveEnvironmentInterpreter:
+
+    def _run(self, coro: Any) -> Any:
+        return AsyncioLoopRunner.run(coro)
+
+    def _env_with_fake_handle(
+        self, monkeypatch: pytest.MonkeyPatch, *, interpreter: Optional[List[str]] = None
+    ) -> tuple[Any, _FakeSandboxHandle]:
+        from evalscope.agent.environments.enclave import EnclaveAgentEnvironment
+
+        _allow_enclave_construction(monkeypatch)
+        _install_fake_ms_enclave(monkeypatch)
+        handle = _FakeSandboxHandle()
+        kwargs = {}
+        if interpreter is not None:
+            kwargs['interpreter'] = interpreter
+        env = EnclaveAgentEnvironment(
+            engine='docker',
+            sandbox_config={'image': 'python:3.11-slim'},
+            **kwargs,
+        )
+
+        async def _ensure_sandbox() -> _FakeSandboxHandle:
+            return handle
+
+        monkeypatch.setattr(env, '_ensure_sandbox', _ensure_sandbox)
+        return env, handle
+
+    def test_exec_uses_backward_compatible_default_interpreter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env, handle = self._env_with_fake_handle(monkeypatch)
+        result = self._run(env.exec(['echo', 'hello world'], cwd='/tmp', env={'FOO': 'bar'}))
+
+        assert result.returncode == 0
+        assert handle.tool_name == 'shell_executor'
+        assert handle.payload is not None
+        assert handle.payload['command'][:2] == ['bash', '-c']
+        assert handle.payload['command'][-1] == "export FOO=bar; cd /tmp && echo 'hello world'"
+        assert handle.payload['timeout'] == 60.0
+
+    def test_none_timeout_uses_environment_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evalscope.agent.environments.enclave import EnclaveAgentEnvironment
+
+        _allow_enclave_construction(monkeypatch)
+        env = EnclaveAgentEnvironment(
+            engine='docker',
+            sandbox_config={'image': 'python:3.11-slim'},
+            timeout=None,
+        )
+
+        assert env._timeout == 60.0
+
+    def test_exec_uses_configured_login_interpreter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env, handle = self._env_with_fake_handle(monkeypatch, interpreter=['bash', '-lc'])
+        result = self._run(env.exec(['python', '-V']))
+
+        assert result.returncode == 0
+        assert handle.payload is not None
+        assert handle.payload['command'][:2] == ['bash', '-lc']
+        assert handle.payload['command'][-1] == 'python -V'
+
+    def test_bash_tool_preserves_configured_login_interpreter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evalscope.agent.tools.bash import run_bash
+
+        env, handle = self._env_with_fake_handle(monkeypatch, interpreter=['bash', '-lc'])
+        call = _tool_call('bash', {'command': 'which python'})
+        obs = self._run(run_bash(call, env))
+
+        assert obs == 'ok'
+        assert handle.payload is not None
+        assert handle.payload['command'][:2] == ['bash', '-lc']
+        assert handle.payload['command'][-1] == 'which python'
+
+    def test_tuple_bash_c_wrapper_is_unwrapped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env, handle = self._env_with_fake_handle(monkeypatch, interpreter=['bash', '-lc'])
+        result = self._run(env.exec(('bash', '-c', 'echo tuple')))
+
+        assert result.returncode == 0
+        assert handle.payload is not None
+        assert handle.payload['command'] == ['bash', '-lc', 'echo tuple']
+
+    def test_bash_c_wrapper_is_not_unwrapped_for_non_bash_interpreter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env, handle = self._env_with_fake_handle(monkeypatch, interpreter=['sh', '-c'])
+        result = self._run(env.exec(['/bin/bash', '-c', 'echo bash contract']))
+
+        assert result.returncode == 0
+        assert handle.payload is not None
+        assert handle.payload['command'] == ['sh', '-c', "/bin/bash -c 'echo bash contract'"]
+
+    def test_unwrapped_bash_command_exports_env_for_whole_script(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env, handle = self._env_with_fake_handle(monkeypatch)
+        result = self._run(env.exec(['/bin/bash', '-c', 'echo "$FOO" && env | grep "^FOO="'], env={'FOO': 'bar'}))
+
+        assert result.returncode == 0
+        assert handle.payload is not None
+        assert handle.payload['command'][-1] == 'export FOO=bar; echo "$FOO" && env | grep "^FOO="'
+
+    def test_env_export_rejects_invalid_variable_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env, handle = self._env_with_fake_handle(monkeypatch)
+
+        with pytest.raises(ValueError, match='Invalid environment variable name'):
+            self._run(env.exec(['echo', 'x'], env={'BAD;KEY': 'value'}))
+        assert handle.payload is None
+
+    def test_env_export_casts_values_to_strings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env, handle = self._env_with_fake_handle(monkeypatch)
+        result = self._run(env.exec(['echo', 'x'], env={'COUNT': 3}))
+
+        assert result.returncode == 0
+        assert handle.payload is not None
+        assert handle.payload['command'][-1] == 'export COUNT=3; echo x'
+
+    def test_exec_maps_ms_enclave_timeout_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env, handle = self._env_with_fake_handle(monkeypatch)
+
+        async def _timed_out(tool_name: str, payload: Dict[str, Any]) -> Any:
+            handle.tool_name = tool_name
+            handle.payload = payload
+            return types.SimpleNamespace(
+                output='',
+                error='Command timed out after 0.3 seconds',
+                status=_FakeExecutionStatus.TIMEOUT,
+                execution_time=0.3,
+            )
+
+        monkeypatch.setattr(handle, 'execute_tool', _timed_out)
+        result = self._run(env.exec(['sleep', '10'], timeout=0.3))
+
+        assert result.timed_out
+        assert result.returncode == -1
+
+    def test_exec_forwards_input_as_a_shell_pipe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``input=`` used to be accepted and silently dropped inside a sandbox.
+
+        ms_enclave's shell_executor takes a command and no stdin, so a runner
+        that piped its prompt (``runners/mock.py``) had it vanish; only the
+        local environment honoured the argument.
+        """
+        env, handle = self._env_with_fake_handle(monkeypatch)
+        self._run(env.exec(['/bin/bash', '-c', 'cat'], input='piped payload'))
+
+        assert handle.payload is not None
+        assert handle.payload['command'][-1] == "printf %s 'piped payload' | ( cat )"
+
+    def test_input_pipe_survives_cwd_and_env_prefixes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The subshell must keep the pipe attached to the command, not to ``cd``."""
+        env, handle = self._env_with_fake_handle(monkeypatch)
+        self._run(env.exec(['/bin/bash', '-c', 'cat'], input='payload', cwd='/w', env={'FOO': 'bar'}))
+
+        assert handle.payload['command'][-1] == "printf %s payload | ( export FOO=bar; cd /w && cat )"
+
+    @pytest.mark.parametrize('shell', ['bash', 'sh'])
+    def test_rendered_input_pipe_runs_in_a_real_shell(self, shell: str) -> None:
+        """Render as the sandbox would, then round-trip it through an actual shell.
+
+        ``sh`` is covered because the pipeline is POSIX syntax, not a bash
+        extension, and ``['sh', '-c']`` is a valid interpreter configuration.
+        On CI ``/bin/sh`` is dash, so this exercises a strict POSIX shell.
+        """
+        from evalscope.agent.environments.enclave import _render_command
+        from evalscope.agent.environments.local import LocalAgentEnvironment
+
+        payload = 'multi\nline with $vars `cmd` \'quotes\' "dquotes" 100%'
+        rendered = _render_command(
+            ['/bin/bash', '-c', 'cat; echo "[$FOO]"'],
+            interpreter=[shell, '-c'],
+            cwd='/tmp',
+            env={'FOO': 'bar'},
+            stdin=payload,
+        )
+        result = self._run(LocalAgentEnvironment().exec([shell, '-c', rendered], timeout=10))
+
+        assert result.returncode == 0
+        assert result.stdout == f'{payload}[bar]\n'
+
+    @pytest.mark.parametrize('interpreter', [['sh', '-c'], ['/bin/sh', '-c'], ['dash', '-c'], ['zsh', '-c']])
+    def test_input_is_rendered_for_any_posix_shell_interpreter(
+        self, monkeypatch: pytest.MonkeyPatch, interpreter: List[str]
+    ) -> None:
+        """Non-bash POSIX shells are valid interpreters and must not be refused."""
+        env, handle = self._env_with_fake_handle(monkeypatch, interpreter=interpreter)
+        self._run(env.exec(['cat'], input='piped payload'))
+
+        assert handle.payload['command'][:2] == interpreter
+        assert handle.payload['command'][-1] == "printf %s 'piped payload' | ( cat )"
+
+    def test_exec_without_input_is_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        env, handle = self._env_with_fake_handle(monkeypatch)
+        self._run(env.exec(['/bin/bash', '-c', 'cat'], cwd='/w'))
+
+        assert handle.payload['command'][-1] == 'cd /w && cat'
+
+    @pytest.mark.parametrize('interpreter', [['python3', '-c'], ['node', '-e']])
+    def test_input_is_rejected_for_a_non_shell_interpreter(
+        self, monkeypatch: pytest.MonkeyPatch, interpreter: List[str]
+    ) -> None:
+        """The pipe is shell syntax; refuse rather than drop the payload again."""
+        env, _ = self._env_with_fake_handle(monkeypatch, interpreter=interpreter)
+
+        with pytest.raises(NotImplementedError, match='cannot supply stdin'):
+            self._run(env.exec(['print(1)'], input='payload'))
+
+    def test_empty_interpreter_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evalscope.agent.environments.enclave import EnclaveAgentEnvironment
+
+        _allow_enclave_construction(monkeypatch)
+        with pytest.raises(ValueError, match='interpreter'):
+            EnclaveAgentEnvironment(
+                engine='docker',
+                sandbox_config={'image': 'python:3.11-slim'},
+                interpreter=[],
+            )
+
+    def test_string_interpreter_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evalscope.agent.environments.enclave import EnclaveAgentEnvironment
+
+        _allow_enclave_construction(monkeypatch)
+        with pytest.raises(TypeError, match='interpreter'):
+            EnclaveAgentEnvironment(
+                engine='docker',
+                sandbox_config={'image': 'python:3.11-slim'},
+                interpreter='bash -lc',
+            )
+
+    def test_swe_bench_agentic_adapter_uses_login_interpreter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evalscope.benchmarks.swe_bench.swe_bench_agentic_adapter import _SWEBenchAgenticAdapterBase
+
+        _allow_enclave_construction(monkeypatch)
+        adapter = object.__new__(_SWEBenchAgenticAdapterBase)
+        adapter.working_dir = '/testbed'
+        adapter.force_arch = ''
+        adapter._task_config = TaskConfig(
+            model='dummy',
+            agent_config=NativeAgentConfig(command_timeout=45),
+            sandbox={
+                'default_config': {
+                    'image': 'custom/base:latest',
+                    'network_enabled': False,
+                }
+            },
+        )
+        sample = types.SimpleNamespace(metadata={'docker_image': 'swebench/example:latest', 'instance_id': 'example'})
+
+        env = adapter.build_environment(sample)
+
+        assert env._interpreter == ['bash', '-lc']
+        assert env._timeout == 45
+        assert 'environment' not in env._sandbox_config_dict
+        assert env._sandbox_config_dict['image'] == 'swebench/example:latest'
+        assert env._sandbox_config_dict['network_enabled'] is False
+        assert env._sandbox_config_dict['env_vars'] == {
+            'PAGER': 'cat',
+            'MANPAGER': 'cat',
+            'LESS': '-R',
+            'PIP_PROGRESS_BAR': 'off',
+            'TQDM_DISABLE': '1',
+        }
+
+    def test_swe_bench_pro_adapter_uses_login_interpreter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evalscope.benchmarks.swe_bench_pro.swe_bench_pro_agentic_adapter import SWEBenchProAgenticAdapter
+
+        _allow_enclave_construction(monkeypatch)
+        adapter = object.__new__(SWEBenchProAgenticAdapter)
+        adapter.working_dir = '/app'
+        adapter._task_config = TaskConfig(model='dummy', agent_config=NativeAgentConfig(command_timeout=46))
+        sample = types.SimpleNamespace(
+            metadata={'docker_image': 'jefzda/sweap-images:example', 'instance_id': 'example'}
+        )
+
+        env = adapter.build_environment(sample)
+
+        assert env._interpreter == ['bash', '-lc']
+        assert env._timeout == 46
+        assert 'environment' not in env._sandbox_config_dict
+        assert env._sandbox_config_dict['env_vars'] == {
+            'PAGER': 'cat',
+            'MANPAGER': 'cat',
+            'LESS': '-R',
+            'PIP_PROGRESS_BAR': 'off',
+            'TQDM_DISABLE': '1',
+        }
+
+    def test_gaia_adapter_uses_env_vars_sandbox_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evalscope.benchmarks.gaia.gaia_adapter import GaiaAdapter
+
+        _allow_enclave_construction(monkeypatch)
+        adapter = object.__new__(GaiaAdapter)
+        adapter._task_config = TaskConfig(
+            model='dummy',
+            agent_config=NativeAgentConfig(command_timeout=180),
+            sandbox={
+                'default_config': {
+                    'image': 'custom/gaia:latest',
+                    'network_enabled': False,
+                }
+            },
+        )
+        adapter._host_files_dir = None
+        sample = types.SimpleNamespace(metadata={'task_id': 'example'})
+
+        env = adapter.build_environment(sample)
+
+        assert env._timeout == 180
+        assert 'environment' not in env._sandbox_config_dict
+        assert env._sandbox_config_dict['image'] == 'custom/gaia:latest'
+        assert env._sandbox_config_dict['network_enabled'] is False
+        assert env._sandbox_config_dict['env_vars'] == {
+            'PAGER': 'cat',
+            'MANPAGER': 'cat',
+            'PIP_PROGRESS_BAR': 'off',
+            'TQDM_DISABLE': '1',
+        }
+
+    def test_gdpval_adapter_uses_env_vars_sandbox_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evalscope.api.benchmark import BenchmarkMeta
+        from evalscope.benchmarks.gdpval.gdpval_adapter import GDPvalAdapter
+
+        _allow_enclave_construction(monkeypatch)
+        adapter = object.__new__(GDPvalAdapter)
+        adapter._benchmark_meta = BenchmarkMeta(name='gdpval', dataset_id='dummy')
+        adapter._task_config = TaskConfig(
+            model='dummy',
+            agent_config=NativeAgentConfig(command_timeout=181),
+            sandbox={
+                'default_config': {
+                    'image': 'custom/gdpval:latest',
+                    'network_enabled': False,
+                }
+            },
+        )
+        adapter.docker_image = 'custom/gdpval:latest'
+        adapter._current_output_dir = None
+        adapter._ensure_docker_image = lambda: None
+        sample = types.SimpleNamespace(id='example', metadata={'task_id': 'example'})
+
+        env = adapter.build_environment(sample)
+
+        sandbox_env = env._env
+        assert sandbox_env._timeout == 181
+        assert 'environment' not in sandbox_env._sandbox_config_dict
+        assert sandbox_env._sandbox_config_dict['image'] == 'custom/gdpval:latest'
+        assert sandbox_env._sandbox_config_dict['network_enabled'] is False
+        assert sandbox_env._sandbox_config_dict['env_vars'] == {
+            'PAGER': 'cat',
+            'MANPAGER': 'cat',
+            'PIP_PROGRESS_BAR': 'off',
+            'TQDM_DISABLE': '1',
+        }
+
+    def test_job_bench_selects_legacy_docker_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from evalscope.benchmarks.job_bench.job_bench_adapter import JobBenchAdapter
+
+        adapter = object.__new__(JobBenchAdapter)
+        adapter._task_config = TaskConfig(
+            model='dummy',
+            agent_config=NativeAgentConfig(environment='docker'),
+        )
+        expected_runtime = MagicMock(spec=AgentEnvironment)
+        monkeypatch.setattr(adapter, '_build_docker_environment', lambda _: expected_runtime)
+
+        runtime = adapter.build_environment(types.SimpleNamespace(metadata={}))
+
+        assert runtime is expected_runtime
+
+
+# ===========================================================================
+# TestLocalEnvironmentExec
+# ===========================================================================
+
+class TestLocalEnvironmentExec:
+
+    def _run(self, coro):
+        return AsyncioLoopRunner.run(coro)
+
+    def _env(self):
+        from evalscope.agent.environments.local import LocalAgentEnvironment
+        return LocalAgentEnvironment()
+
+    def test_exec_echo(self):
+        env = self._env()
+        result = self._run(env.exec(['echo', 'hello']))
+        assert result.returncode == 0
+        assert 'hello' in result.stdout
+        assert not result.timed_out
+
+    def test_exec_nonzero_returncode(self):
+        env = self._env()
+        result = self._run(env.exec(['bash', '-c', 'exit 42']))
+        assert result.returncode == 42
+
+    def test_exec_stderr(self):
+        env = self._env()
+        result = self._run(env.exec(['bash', '-c', 'echo err >&2; exit 1']))
+        assert 'err' in result.stderr
+        assert result.returncode != 0
+
+    def test_exec_does_not_inherit_the_evaluator_stdin(self):
+        """A sandboxed command must not be able to read the evaluator's stdin.
+
+        Without an explicit stdin the child inherits fd 0 from the evalscope
+        process. Attached to a terminal that means a model-generated command
+        which reads stdin blocks on the operator's keyboard until the tool
+        timeout, and can consume what they type; #1685 is that shape of
+        failure inside a sandbox.
+        """
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b'EVALUATOR STDIN\n')
+        os.close(write_fd)
+        saved_stdin = os.dup(0)
+        try:
+            os.dup2(read_fd, 0)
+            result = self._run(self._env().exec(['bash', '-c', 'cat']))
+        finally:
+            os.dup2(saved_stdin, 0)
+            os.close(saved_stdin)
+            os.close(read_fd)
+
+        assert result.returncode == 0
+        assert result.stdout == '', f'the command read the evaluator stdin: {result.stdout!r}'
+
+    def test_exec_still_pipes_explicit_input(self):
+        env = self._env()
+        result = self._run(env.exec(['bash', '-c', 'cat'], input='piped payload'))
+        assert result.stdout == 'piped payload'
+
+    def test_exec_timeout(self):
+        env = self._env()
+        result = self._run(env.exec(['sleep', '10'], timeout=0.3))
+        assert result.timed_out
+        assert result.returncode == -1
+
+    def test_exec_cwd(self):
+        env = self._env()
+        result = self._run(env.exec(['pwd'], cwd='/tmp'))
+        assert '/tmp' in result.stdout
+
+    def test_exec_with_env_vars(self):
+        from evalscope.agent.environments.local import LocalAgentEnvironment
+        env = LocalAgentEnvironment(env_vars={'MY_VAR': 'hello_from_test'})
+        result = self._run(env.exec(['bash', '-c', 'echo $MY_VAR']))
+        assert 'hello_from_test' in result.stdout
+
+    def test_close_is_idempotent(self):
+        env = self._env()
+        self._run(env.close())
+        self._run(env.close())  # second call must not raise
+
+    def test_context_manager(self):
+        async def _cm():
+            from evalscope.agent.environments.local import LocalAgentEnvironment
+            async with LocalAgentEnvironment() as env:
+                result = await env.exec(['echo', 'cm'])
+            return result
+
+        result = self._run(_cm())
+        assert 'cm' in result.stdout
+
+    def test_exec_result_duration_positive(self):
+        env = self._env()
+        result = self._run(env.exec(['echo', 'hi']))
+        assert result.duration >= 0
+
+
+# ===========================================================================
+# TestLocalEnvironmentTools  (tool handlers with LocalAgentEnvironment)
+# ===========================================================================
+
+class TestLocalEnvironmentTools:
+
+    def _run(self, coro):
+        return AsyncioLoopRunner.run(coro)
+
+    def _env(self):
+        from evalscope.agent.environments.local import LocalAgentEnvironment
+        return LocalAgentEnvironment()
+
+    def test_bash_tool_runs_command(self):
+        from evalscope.agent.tools.bash import run_bash
+        env = self._env()
+        call = _tool_call('bash', {'command': 'echo hello_bash'})
+        obs = self._run(run_bash(call, env))
+        assert 'hello_bash' in obs
+
+    def test_bash_tool_without_env_raises(self):
+        from evalscope.agent.tools.bash import run_bash
+        call = _tool_call('bash', {'command': 'echo x'})
+        with pytest.raises(PermissionError, match='requires an AgentEnvironment'):
+            self._run(run_bash(call, None))
+
+    def test_bash_tool_stderr_in_output(self):
+        from evalscope.agent.tools.bash import run_bash
+        env = self._env()
+        call = _tool_call('bash', {'command': 'echo err >&2 && exit 0'})
+        obs = self._run(run_bash(call, env))
+        # stderr section is present when non-empty
+        assert '[stderr]' in obs
+
+    def test_python_exec_tool_runs_code(self):
+        from evalscope.agent.tools.python_exec import run_python_exec
+        env = self._env()
+        call = _tool_call('python_exec', {'code': 'print(2 + 2)'})
+        obs = self._run(run_python_exec(call, env))
+        assert '4' in obs
+
+    def test_python_exec_tool_without_env_raises(self):
+        from evalscope.agent.tools.python_exec import run_python_exec
+        call = _tool_call('python_exec', {'code': 'print(1)'})
+        with pytest.raises(PermissionError):
+            self._run(run_python_exec(call, None))
+
+
+# ===========================================================================
+# TestDockerEnvironmentExec  (requires Docker)
+# ===========================================================================
+
+@docker_mark
+class TestDockerEnvironmentExec:
+    """Integration tests for ``EnclaveAgentEnvironment`` with the docker engine.
+
+    These tests create real Docker containers using the ``python:3.11-slim``
+    image.  Each test uses its own environment instance (= its own container).
+    """
+
+    def _run(self, coro):
+        return AsyncioLoopRunner.run(coro)
+
+    def _env(self):
+        from evalscope.agent.environments.enclave import EnclaveAgentEnvironment
+        return EnclaveAgentEnvironment(
+            engine='docker',
+            sandbox_config={'image': 'python:3.11-slim'},
+            timeout=30.0,
+        )
+
+    def teardown_method(self, method):
+        """Reset the class-level manager between test classes to avoid leakage."""
+        # We intentionally leave the manager running (shared singleton) for
+        # performance; individual containers are deleted per-sample via close().
+
+    def test_exec_echo(self):
+        env = self._env()
+        try:
+            result = self._run(env.exec(['echo', 'hello docker']))
+            assert result.returncode == 0
+            assert 'hello docker' in result.stdout
+            assert not result.timed_out
+        finally:
+            self._run(env.close())
+
+    def test_exec_timeout_terminates_container_process(self):
+        env = self._env()
+        marker = '/workspace/timeout-marker'
+        try:
+            result = self._run(env.exec(['/bin/bash', '-c', f'sleep 2; touch {marker}'], timeout=0.3))
+            assert result.timed_out
+            assert result.returncode == -1
+
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                check = self._run(env.exec(['/bin/bash', '-c', f'test -e {marker} && echo PRESENT || echo ABSENT']))
+                assert check.stdout.strip() == 'ABSENT'
+                time.sleep(0.25)
+        finally:
+            self._run(env.close())
+
+    def test_exec_python(self):
+        env = self._env()
+        try:
+            result = self._run(env.exec(['python3', '-c', 'print(1+1)']))
+            assert result.returncode == 0
+            assert '2' in result.stdout
+        finally:
+            self._run(env.close())
+
+    def test_exec_nonzero_returncode(self):
+        env = self._env()
+        try:
+            result = self._run(env.exec(['/bin/bash', '-c', 'exit 5']))
+            assert result.returncode == 5
+        finally:
+            self._run(env.close())
+
+    def test_exec_cwd(self):
+        env = self._env()
+        try:
+            # default working_dir is /workspace; verify via pwd
+            result = self._run(env.exec(['/bin/bash', '-c', 'pwd']))
+            assert result.returncode == 0
+            assert '/workspace' in result.stdout or result.returncode == 0
+        finally:
+            self._run(env.close())
+
+    def test_close_idempotent(self):
+        env = self._env()
+        # Trigger container creation
+        self._run(env.exec(['true']))
+        # First close
+        self._run(env.close())
+        # Second close must not raise
+        self._run(env.close())
+
+    def test_multiple_env_instances_isolated(self):
+        """Two environment instances should get separate containers."""
+        env1 = self._env()
+        env2 = self._env()
+        try:
+            r1 = self._run(env1.exec(['bash', '-c', 'echo env1 > /workspace/marker.txt && cat /workspace/marker.txt']))
+            r2 = self._run(env2.exec(['bash', '-c', 'echo env2 > /workspace/marker.txt && cat /workspace/marker.txt']))
+            # Each container has its own filesystem; markers stay isolated.
+            assert 'env1' in r1.stdout
+            assert 'env2' in r2.stdout
+        finally:
+            self._run(env1.close())
+            self._run(env2.close())
+
+    def test_context_manager(self):
+        async def _cm():
+            from evalscope.agent.environments.enclave import EnclaveAgentEnvironment
+            async with EnclaveAgentEnvironment(
+                engine='docker',
+                sandbox_config={'image': 'python:3.11-slim'},
+            ) as env:
+                result = await env.exec(['echo', 'ctx_mgr'])
+            return result
+
+        result = self._run(_cm())
+        assert 'ctx_mgr' in result.stdout
+
+
+# ===========================================================================
+# TestDockerEnvironmentTools  (bash + python_exec with docker)
+# ===========================================================================
+
+@docker_mark
+class TestDockerEnvironmentTools:
+
+    def _run(self, coro):
+        return AsyncioLoopRunner.run(coro)
+
+    def _env(self):
+        from evalscope.agent.environments.enclave import EnclaveAgentEnvironment
+        return EnclaveAgentEnvironment(
+            engine='docker',
+            sandbox_config={'image': 'python:3.11-slim'},
+            timeout=30.0,
+        )
+
+    def test_bash_tool_in_docker(self):
+        from evalscope.agent.tools.bash import run_bash
+        env = self._env()
+        try:
+            call = _tool_call('bash', {'command': 'echo docker_bash'})
+            obs = self._run(run_bash(call, env))
+            assert 'docker_bash' in obs
+        finally:
+            self._run(env.close())
+
+    def test_python_exec_tool_in_docker(self):
+        from evalscope.agent.tools.python_exec import run_python_exec
+        env = self._env()
+        try:
+            call = _tool_call('python_exec', {'code': 'print("docker_py", 2**10)'})
+            obs = self._run(run_python_exec(call, env))
+            assert '1024' in obs
+        finally:
+            self._run(env.close())
+
+
+# ===========================================================================
+# TestAgentLoopWithEnvironment  (AgentLoop + local env + bash tool)
+# ===========================================================================
+
+class TestAgentLoopWithEnvironment:
+    """Verify the AgentLoop correctly wires environment through ToolExecutor."""
+
+    def _run(self, coro):
+        return AsyncioLoopRunner.run(coro)
+
+    def test_loop_uses_environment_via_bash_tool(self):
+        """Model calls bash → env.exec is invoked → result observed."""
+        from evalscope.agent.environments.local import LocalAgentEnvironment
+        from evalscope.agent.tools.bash import run_bash
+        from evalscope.api.registry import get_strategy
+
+        env = LocalAgentEnvironment()
+        handlers = {'bash': run_bash}
+
+        # Model: first call returns a bash tool_call; second call returns submit.
+        bash_call = _tool_call('bash', {'command': 'echo agent_output'}, call_id='tc-bash')
+        first_output = _make_output(
+            content='',
+            tool_calls=[bash_call],
+            stop_reason='tool_calls',
+        )
+        submit_call = _tool_call('submit', {'answer': 'agent_output'}, call_id='tc-submit')
+        second_output = _make_output(content='', tool_calls=[submit_call])
+
+        model = MagicMock()
+        model.generate_async = AsyncMock(side_effect=[first_output, second_output])
+
+        strategy = get_strategy('function_calling')()
+        tool_executor = ToolExecutor(handlers=handlers, environment=env)
+        ctx = AgentContext(
+            sample_id='test-env-loop',
+            messages=[ChatMessageUser(content='run bash')],
+            tools=[],
+        )
+        trace = AgentTrace(strategy='function_calling', max_steps=5)
+        loop = AgentLoop(
+            model=model,
+            strategy=strategy,
+            tool_executor=tool_executor,
+            environment=env,
+            max_steps=5,
+            trace=trace,
+        )
+
+        result = self._run(loop.run(ctx))
+
+        # Verify tool was called and observation includes bash output
+        tool_msg = next(
+            (m for m in result.messages if getattr(m, 'role', None) == 'tool'),
+            None,
+        )
+        assert tool_msg is not None, 'Expected a tool message in conversation'
+        assert 'agent_output' in tool_msg.content, (
+            f'Expected bash output in tool message, got: {tool_msg.content!r}'
+        )
+
+        # ENV_EXEC event should NOT be in trace (bash uses env.exec via AgentEnvironment,
+        # not a separate ENV_EXEC emitter); TOOL_RESULT IS expected.
+        event_types = {ev.type for ev in result.trace.events}
+        assert EventType.TOOL_RESULT in event_types
+        assert EventType.SUBMIT in event_types
+
+
+# ===========================================================================
+# TestDefaultAdapterEnvPath  (DefaultDataAdapter._on_agent_inference with env)
+# ===========================================================================
+
+class TestDefaultAdapterEnvPath:
+    """Test that _on_agent_inference instantiates environment and merges tool infos."""
+
+    def test_tool_infos_merged_into_ctx(self):
+        """When agent_config.tools=['bash'], bash ToolInfo is passed to the model."""
+        from evalscope.api.benchmark.adapters.default_data_adapter import DefaultDataAdapter
+        from evalscope.api.dataset import Sample
+
+        # Build a minimal adapter bypassing __init__
+        adapter = DefaultDataAdapter.__new__(DefaultDataAdapter)
+        cfg = NativeAgentConfig(strategy='function_calling', tools=['bash'], max_steps=1)
+        task_cfg = MagicMock()
+        task_cfg.agent_config = cfg
+        adapter._task_config = task_cfg
+
+        # Model: return final answer immediately (no tool calls)
+        final_out = _make_output(content='done')
+        model = MagicMock()
+        model.generate.return_value = final_out
+        # AgentLoop awaits ``generate_async``.
+        model.generate_async = AsyncMock(return_value=final_out)
+
+        sample = MagicMock()
+        sample.id = 'x'
+        sample.input = 'hello'
+        sample.tools = []
+
+        output = adapter._on_inference(model, sample)
+
+        model.generate_async.assert_awaited_once()
+        assert model.generate_async.call_args.kwargs['tools']
+        assert output is not None
+
+    def test_environment_extra_forwarded(self):
+        """environment_extra is forwarded to the environment constructor."""
+        from evalscope.api.benchmark.adapters.default_data_adapter import DefaultDataAdapter
+        from evalscope.api.dataset import Sample
+
+        adapter = DefaultDataAdapter.__new__(DefaultDataAdapter)
+        cfg = NativeAgentConfig(
+            strategy='function_calling',
+            tools=[],
+            max_steps=1,
+            environment='local',
+            environment_extra={
+                'working_dir': '/tmp',
+            },
+        )
+        task_cfg = MagicMock()
+        task_cfg.agent_config = cfg
+        adapter._task_config = task_cfg
+
+        final_out = _make_output(content='env done')
+        model = MagicMock()
+        model.generate_async = AsyncMock(return_value=final_out)
+
+        sample = MagicMock()
+        sample.id = 'env-test'
+        sample.input = 'test env'
+        sample.tools = []
+
+        output = adapter._on_inference(model, sample)
+        assert output is not None
+        # The runtime was created and closed; trace agent-runtime name should match.
+        trace = output.trace
+        assert trace is not None
+        assert trace.environment == 'local'
+
+
+# ===========================================================================
+# TestNativeAgentEnvironmentConfig  (NativeAgentConfig schema)
+# ===========================================================================
+
+class TestNativeAgentEnvironmentConfig:
+
+    def test_default_environment_is_none(self):
+        cfg = NativeAgentConfig()
+        assert cfg.environment is None
+        assert cfg.environment_extra == {}
+
+    def test_environment_config_accepted(self):
+        cfg = NativeAgentConfig(
+            strategy='function_calling',
+            environment='docker',
+            environment_extra={
+                'image': 'python:3.11-slim',
+                'working_dir': '/workspace',
+            },
+        )
+        assert cfg.environment_extra['image'] == 'python:3.11-slim'
+        assert cfg.environment == 'docker'
+
+    def test_environment_config_serialises_compatibly(self):
+        cfg = NativeAgentConfig(environment='docker', environment_extra={'key': 'val'})
+        d = cfg.model_dump()
+        assert d['environment'] == 'docker'
+        assert d['environment_extra'] == {'key': 'val'}
+        assert 'runtime' not in d
+
+    def test_kwargs_and_environment_config_independent(self):
+        cfg = NativeAgentConfig(kwargs={'system_prompt': 'hi'}, environment='docker', environment_extra={'image': 'x'})
+        assert 'system_prompt' in cfg.kwargs
+        assert 'system_prompt' not in cfg.environment_extra
+        assert 'image' in cfg.environment_extra
+        assert 'image' not in cfg.kwargs
+
+    def test_unpublished_runtime_shape_is_rejected(self):
+        with pytest.raises(ValueError, match='Extra inputs are not permitted'):
+            NativeAgentConfig(runtime='docker')
+        with pytest.raises(ValueError, match='Extra inputs are not permitted'):
+            NativeAgentConfig(runtime_extra={'image': 'python:3.11-slim'})
+
+    def test_task_config_update_revalidates_agent_config(self):
+        cfg = TaskConfig(agent_config={'mode': 'native'})
+        cfg.update({
+            'agent_config': {
+                'environment': 'local',
+                'environment_extra': {
+                    'working_dir': '/tmp',
+                },
+            }
+        })
+        assert isinstance(cfg.agent_config, NativeAgentConfig)
+        assert cfg.agent_config.environment == 'local'
+        assert cfg.agent_config.environment_extra == {'working_dir': '/tmp'}
+
+    def test_task_config_update_preserves_explicit_agent_fields(self):
+        cfg = TaskConfig(agent_config=NativeAgentConfig(max_steps=7))
+
+        cfg.update({})
+
+        assert isinstance(cfg.agent_config, NativeAgentConfig)
+        assert cfg.agent_config.max_steps == 7
+        assert 'max_steps' in cfg.agent_config.model_fields_set
+        assert 'strategy' not in cfg.agent_config.model_fields_set
+        assert 'kwargs' not in cfg.agent_config.model_fields_set

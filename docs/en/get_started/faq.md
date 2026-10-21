@@ -1,0 +1,285 @@
+# ❓ FAQ
+
+This section compiles common issues and solutions encountered when using EvalScope.
+
+```{important}
+We recommend updating to the latest `main` branch code when encountering issues. Many problems may have already been fixed in the latest version.
+```
+
+## Quick Navigation
+
+- [❓ FAQ](#-faq)
+  - [Quick Navigation](#quick-navigation)
+  - [Installation \& Environment](#installation--environment)
+  - [Model Evaluation](#model-evaluation)
+    - [Evaluation Configuration \& Parameters](#evaluation-configuration--parameters)
+    - [Result Anomalies \& Troubleshooting](#result-anomalies--troubleshooting)
+    - [Model \& Dataset Support](#model--dataset-support)
+    - [Framework Usage \& Extension](#framework-usage--extension)
+  - [Performance Testing (perf)](#performance-testing-perf)
+    - [Basic Usage \& Configuration](#basic-usage--configuration)
+    - [Performance Metrics \& Troubleshooting](#performance-metrics--troubleshooting)
+  - [Citing Us](#citing-us)
+
+## Installation & Environment
+
+**Q: How to use EvalScope through Docker?**
+
+**A:** You can use the official ModelScope image which includes EvalScope. For details, please refer to the [Environment Setup Documentation](https://modelscope.cn/docs/intro/environment-setup#%E6%9C%80%E6%96%B0%E9%95%9C%E5%83%8F).
+
+**Q: What to do when compilation fails during `pip install evalscope[all]`?**
+
+**A:** Try installing `pip install python-dotenv` separately first, then execute `pip install evalscope[all]`.
+
+**Q: Environment conflicts between `evalscope[service]` and other libraries (like `bfcl-eval`)?**
+
+**A:** Please try installing these libraries separately rather than in a single command. For `bfcl-eval`, try version `2025.6.16`.
+
+**Q: How to handle the `trust_remote_code=True` warning during evaluation?**
+
+**A:** This is an informational warning that doesn't affect the evaluation process. EvalScope framework has `trust_remote_code=True` set by default, so you can use it safely.
+
+**Q: Error in Notebook environment: `RuntimeError: Cannot run the event loop while another loop is running`?**
+
+**A:** Please write the evaluation code in a Python script file (`.py`) and execute it in the terminal, avoiding running it in Notebook.
+
+## Model Evaluation
+
+### Evaluation Configuration & Parameters
+
+**Q: How to conduct pass@k evaluation or generate multiple answers for a single sample?**
+
+**A:** The `pass@k` metric supports all datasets with `mean` as the aggregation method. Specific setup instructions:
+1. Set `repeats=k` in `TaskConfig`
+2. Set in `dataset_args`:
+`'<dataset_name>': {'aggregation': 'mean_and_pass_at_k'}`
+1. When running the evaluation, each sample will be repeated `k` times, and all `pass@n, 1<=n<=k` metrics will be calculated.
+
+For details, please [refer to](https://github.com/modelscope/evalscope/pull/964) the examples provided. Additionally, `mean_and_vote_at_k` and `mean_and_pass_hat_k` aggregation methods are also supported.
+
+**Q: How to remove the "thinking process" (such as `<think>...</think>`) from model outputs?**
+
+**A:** For `evalscope >= v1.0` versions, **paired** `<think>...</think>` blocks are stripped automatically.
+
+Note: most thinking models (Qwen3, DeepSeek series, etc.) prefill `<think>` into the prompt via their chat template, so the completion only contains the closing `</think>`. Such **unpaired** tags are not stripped automatically, the thinking process stays in the output and can interfere with answer extraction. Use any of the following:
+
+1.  **Enable a reasoning parser on the inference engine** (recommended): pass `--reasoning-parser` when starting SGLang / vLLM (see the engine docs for the accepted values). The thinking content is then returned in a separate `reasoning_content` field, which EvalScope picks up automatically, so `prediction` no longer contains it.
+2.  **Configure `filters` yourself**: use `--dataset-args` to remove everything before `</think>` for a specific dataset:
+    ```shell
+    --dataset-args '{"ifeval": {"filters": {"remove_until": "</think>"}}}'
+    ```
+    If your model uses different thinking tags like `<|end_of_thinking|>`, simply replace it accordingly.
+3.  **Fall back to a judge model**: set `judge={'strategy': 'llm_recall', 'models': {...}}` so rule-based misses are re-judged. See "Abnormal Results & Troubleshooting" below.
+
+**Q: How to use a local model as a Judge Model?**
+
+**A:** You can deploy the local model as an API service using frameworks like vLLM, then set its service address in `--judge` under `models`.
+
+**Q: How to set timeout for judge models?**
+
+**A:** Set `generation_config.timeout` for the relevant entry in `judge.models`.
+
+**Q: How to add custom request headers when evaluating API services?**
+
+**A:** Set `extra_headers` in `generation_config`.
+```python
+# Example
+task_config = TaskConfig(
+    # ...
+    generation_config={'extra_headers': {'Authorization': 'Bearer YOUR_TOKEN'}}
+)
+```
+
+**Q: How to set up multi-GPU evaluation?**
+
+**A:** EvalScope currently doesn't support Data Parallel. However, you can achieve model parallelism through:
+1.  **Using inference services**: Start a multi-GPU inference service with frameworks like vLLM (e.g., set `--tensor-parallel-size`), then evaluate through API.
+2.  **Local loading**: Specify `device_map=auto` in `--model-args` to automatically distribute model weights across multiple devices.
+
+**Q: Error with `stream` parameter: `unrecognized arguments: --stream True`?**
+
+**A:** `--stream` is a switch parameter, use it directly without appending `True`. Correct usage: `--stream`.
+
+### Result Anomalies & Troubleshooting
+
+**Q: How to troubleshoot obviously abnormal evaluation results (like extremely low accuracy)?**
+
+**A:** Please follow these steps:
+1.  **Check model interface**: Confirm that the model service or local model can generate responses normally.
+2.  **Review prediction files**: Check JSONL files in the `outputs/<timestamp>/predictions/` directory to confirm model outputs meet expectations.
+3.  **Visualization analysis**: Use `evalscope service` to start the visualization interface for intuitive result viewing and analysis.
+
+**Q: Unstable evaluation results - inconsistent across runs?**
+
+**A:** Inconsistent results are usually caused by sampling randomness. Try these methods to stabilize results:
+1.  Set `temperature=0` in `generation_config`.
+2.  Set a fixed `seed` parameter.
+
+**Q: When evaluating `humaneval` and other code generation tasks, scores are much lower than expected?**
+
+**A:**
+1.  **Check model type**: Use Instruct or Chat models. Base models may have issues like repetition due to not following instructions.
+2.  **Remove thinking process**: Some models generate thinking process before code. Please refer to [this method](#evaluation-configuration--parameters) for filtering.
+3.  **Adjust generation length**: Default maximum generation length may be insufficient. Please appropriately increase `max_tokens` in `generation_config`.
+
+**Q: Inaccurate answer extraction or misjudgments when evaluating `MATH-500` dataset?**
+
+**A:** Math problem answer formats are complex, and rule-based parsing can't cover all cases. We recommend using LLM as an auxiliary judge to improve accuracy:
+```python
+# Set in TaskConfig or DataAdapter
+judge={
+    'strategy': 'llm_recall',
+    'models': {'model_id': 'qwen2.5-72b-instruct', 'api_url': '...', 'api_key': '...'},
+}
+```
+Reference documentation: [Judge Model Parameters](https://evalscope.readthedocs.io/zh-cn/latest/get_started/parameters.html#judge).
+
+**Q: Multiple-choice datasets (e.g. `gpqa_diamond`, `mmlu`) are graded incorrectly, with an empty or wrong `extracted_prediction`?**
+
+**A:** The usual cause is a thinking process left in the model output, which interferes with rule-based extraction. For example the model first restates the required `ANSWER: [LETTER]` format, or discusses an option it then rejects. Recommended:
+1.  Strip the thinking process first, as described [above](#evaluation-configuration--parameters) (enable a reasoning parser on the inference engine, or configure `filters: {"remove_until": "</think>"}`).
+2.  Then add a judge model as a fallback so failed rule-based extractions are recalled:
+    ```python
+    # Set in TaskConfig
+    judge={'strategy': 'llm_recall', 'models': {'model_id': '...', 'api_url': '...', 'api_key': '...'}}
+    ```
+    `llm_recall` only calls the judge model when the rule-based score is not perfect, so it adds no across-the-board overhead.
+
+**Q: `Connection error` when evaluating `alpaca_eval`?**
+
+**A:** `alpaca_eval` requires a Judge Model for scoring. It uses OpenAI API by default, and connection will fail if related keys are not configured. Specify one through `--judge`.
+
+**Q: How to continue from checkpoint after evaluation interruption?**
+
+**A:** Checkpoint resumption is supported. Use the `--use-cache` parameter and specify the output directory path from the previous evaluation to reuse completed model predictions and evaluation results.
+
+**Q: `evalscope service` visualization interface is inaccessible or charts display abnormally?**
+
+**A:**
+- **Inaccessible**: Make sure the service is running and open the Dashboard URL printed on startup in your browser. If the port is in use, specify another port with `--port`.
+- **Chart anomalies**: Try upgrading `plotly` to the latest version.
+
+**Q: Error when loading models locally: `Expected all tensors to be on the same device`?**
+
+**A:** This is usually caused by insufficient GPU memory. `device_map='auto'` may allocate some weights to CPU. Please ensure sufficient GPU memory or try running on smaller models.
+
+### Model & Dataset Support
+
+**Q: How to evaluate multimodal models (like Qwen-VL, Gemma3)?**
+
+**A:** The recommended approach is the Native backend with API-based evaluation: deploy the multimodal model as an OpenAI-compatible service using vLLM, ms-swift, LMDeploy, etc., then run `evalscope eval` against multimodal benchmarks (e.g. `ocr_bench`, `mmmu`, `math_vista` — see the full list in [VLM Benchmarks](../get_started/supported_dataset/vlm.md)). The Native backend does not support loading multimodal model checkpoints locally for evaluation. If you need the VLMEvalKit backend, see [VLMEvalKit Backend](../user_guides/backend/vlmevalkit_backend.md).
+
+**Q: Error when evaluating `embeddings` models via API service: `dimensions is currently not supported`?**
+
+**A:** Set `'dimensions': None` in `generation_config` or don't pass this parameter.
+
+**Q: Error when loading datasets locally (like missing `dtype`)?**
+
+**A:** This is a known issue. Temporary solution: manually delete the `dataset_infos.json` file in the dataset cache directory, then retry.
+
+**Q: How to use custom datasets for evaluation?**
+
+**A:** EvalScope supports custom datasets. Please refer to the following documentation:
+- **LLM Custom Datasets**: [Link](https://evalscope.readthedocs.io/zh-cn/latest/advanced_guides/custom_dataset/llm.html)
+- **Multimodal Custom Datasets**: [Link](https://evalscope.readthedocs.io/zh-cn/latest/user_guides/stress_test/custom.html#id3)
+
+**Q: What do `-f`, `-p`, `-r` represent in `rouge` metrics?**
+
+**A:** They are three variants of the ROUGE metric:
+- **-r (Recall)**: Measures how much of the reference text content is covered by generated text.
+- **-p (Precision)**: Measures how much content in generated text is accurate and relevant.
+- **-f (F-measure)**: F1-score, harmonic mean of precision and recall, serving as a comprehensive metric.
+
+### Framework Usage & Extension
+
+**Q: How to add a custom Benchmark?**
+
+**A:** You can inherit from `DataAdapter` and implement its methods, then register through the `@register_benchmark` decorator. For detailed steps, please refer to [Adding Benchmark Documentation](https://evalscope.readthedocs.io/zh-cn/latest/advanced_guides/add_benchmark.html).
+
+**Q: How to adapt custom model APIs that are not OpenAI-style?**
+
+**A:** You can implement your own `Model` class to interface with specific API formats. Please refer to [Custom Model Tutorial](https://evalscope.readthedocs.io/zh-cn/latest/advanced_guides/custom_model.html).
+
+**Q: How to debug or modify EvalScope source code?**
+
+**A:** Please use source code installation. After cloning the project locally, execute `pip install -e .` in the project root directory. This way, any modifications to the code will take effect immediately.
+
+**Q: Why can't evaluation metrics align between EvalScope and OpenCompass?**
+
+**A:** Different evaluation frameworks have differences in implementation details (like prompt templates, post-processing logic, metric calculation methods), making it difficult to achieve complete alignment. We recommend conducting horizontal comparisons between models within the same framework.
+
+## Performance Testing (perf)
+
+### Basic Usage & Configuration
+
+**Q: What should I fill in for the `--url` parameter in `evalscope perf`?**
+
+**A:**
+- **General scenarios**: For most OpenAI API-compatible services, use the `/v1/chat/completions` endpoint.
+- **`speed_benchmark` dataset**: This specific dataset is used for testing completion performance and should be used with the `/v1/completions` endpoint to avoid overhead from Chat Template processing.
+
+**Q: How to use local files as stress test datasets?**
+
+**A:** Specify `--dataset-path` and set `--dataset line_by_line`. The program will read file content line by line as prompts.
+
+**Q: How to use pre-downloaded datasets in offline environments?**
+
+**A:** Use `--dataset-path` to point to the local dataset path. Two approaches are supported:
+
+- **Point to a directory** (for Arrow/Parquet format datasets like `flickr8k`, `kontext_bench`, `longalpaca`):
+  ```bash
+  evalscope perf --dataset kontext_bench --dataset-path /path/to/local/kontext-bench ...
+  ```
+- **Point to a file** (for JSONL format datasets like `openqa`, `share_gpt_zh`):
+  ```bash
+  evalscope perf --dataset openqa --dataset-path /path/to/open_qa.jsonl ...
+  ```
+
+You can also use `--data-source` to specify the data source (defaults to `modelscope`, can be switched to `huggingface`).
+
+**Q: How to stress test multimodal models?**
+
+**A:** Currently supports the `flickr8k` dataset for multimodal stress testing. Set `--dataset flickr8k`.
+
+**Q: How to set System Prompt during stress testing?**
+
+**A:** Pass it as a JSON string in the `model` parameter, for example:
+```shell
+--model '{"model": "my-model", "system_prompt": "You are a helpful assistant."}'
+```
+
+### Performance Metrics & Troubleshooting
+
+**Q: When stress testing Ollama, concurrency won't increase - what to do?**
+
+**A:** Try setting the environment variable `export OLLAMA_NUM_PARALLEL=10` (or other appropriate value) before executing the stress test command to increase Ollama's parallel processing capability.
+
+**Q: Why is TTFT (Time To First Token) the same as Latency (Total Latency)?**
+
+**A:** To accurately measure TTFT, you must add the `--stream` parameter in the stress test command to enable streaming output. Otherwise, TTFT will equal the total latency when receiving complete responses.
+
+**Q: TTFT metric is too high during stress testing, far exceeding single request response time?**
+
+**A:** When concurrency exceeds service processing capacity, requests enter a queue to wait. TTFT includes queuing time, so increased TTFT under high concurrency is normal and reflects the service's real performance under high load.
+
+**Q: Stress test results show `nan`?**
+
+**A:** Please check if input data format is correct. For example, the `openqa` dataset uses the `question` field in JSONL files as prompts by default. If fields don't match or file format is incorrect, it may cause inability to process requests properly.
+
+**Q: How to visualize stress test results?**
+
+**A:** Start `evalscope service` with the output root containing the `perf` results (default: `outputs/`), then open the **Performance** page in the Web Dashboard. You can also send results to `wandb`, `swanlab`, or `clearml`. See the [Stress Test Result Visualization Guide](../user_guides/stress_test/quick_start.md#visualizing-test-results).
+
+## Citing Us
+
+**Q: I used EvalScope in my work - how should I cite it?**
+
+**A:** Thank you very much! You can use the following BibTeX format to cite our work:
+```bibtex
+@misc{evalscope_2024,
+    title={{EvalScope}: Evaluation Framework for Large Models},
+    author={ModelScope Team},
+    year={2024},
+    url={https://github.com/modelscope/evalscope}
+}
+```

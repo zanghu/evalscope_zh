@@ -1,0 +1,68 @@
+{
+  "meta": {
+    "pretty_name": "ABC Coding",
+    "dataset_id": "abc_coding",
+    "paper_url": null,
+    "tags": [
+      "Coding",
+      "Agent",
+      "Custom"
+    ],
+    "metrics": [
+      "resolved",
+      "f2p_pass_rate",
+      "p2p_pass_rate",
+      "evaluation_coverage"
+    ],
+    "few_shot_num": 0,
+    "eval_split": "test",
+    "train_split": "",
+    "subset_list": [
+      "default"
+    ],
+    "description": "\n## Overview\nABC Coding runs local repository development tasks through an OpenCode HTTP server. It consumes a local JSONL case index\nand preserves candidate code and session records. Optional local verification grades trusted repository tests.\n\n## Task Description\n- **Task Type**: Repository-level software development\n- **Input**: A task document and a checksummed initial source directory\n- **Output**: Candidate source archive, binary Git patch, session transcript, and execution metadata\n- **Domain**: Custom software engineering cases\n\n## Key Features\n- Uses the standard local dataset loader for selection, limits, and repeats.\n- Creates a fresh local Git baseline per attempt without exposing verifier files or solution history.\n- Uses HTTP session control rather than CLI prompt input or output parsing.\n- Preserves failures per case and supports serial batches with multiple repositories.\n- Supports verification-only replay and baseline calibration without calling a coding model.\n\n## Evaluation Notes\n- Requires Git, a configured OpenCode server, and the project's local toolchain.\n- OpenCode calls its configured provider directly; EvalScope's model bridge is not involved.\n- Use eval_type=mock_llm as an unused framework model placeholder and eval_batch_size=1.\n- Development-only runs exclude functional scores. Verification reports resolved, group pass rates, and evaluation coverage.\n- Verification uses fresh candidate copies, trusted overlays, declared commands, and Jest JSON or JUnit XML reports.\n- Incomplete evidence is unscored; failed assertions score zero. Local execution is not adversarial isolation.\n- Local execution is not a security sandbox. Pending permission/question requests stop the attempt for review.\n",
+    "prompt_template": "{question}",
+    "system_prompt": "",
+    "few_shot_prompt_template": "",
+    "aggregation": "mean",
+    "extra_params": {
+      "opencode": {
+        "type": "dict",
+        "value": {},
+        "description": "OpenCodeHTTPConfig connection and policy."
+      },
+      "coding": {
+        "type": "dict",
+        "value": {},
+        "description": "CodingRunConfig mode and candidate directories."
+      }
+    },
+    "sandbox_config": {},
+    "category": "agent",
+    "primary_metric": {
+      "name": "resolved",
+      "aggregation": "mean",
+      "dimensions": {}
+    }
+  },
+  "statistics": {
+    "total_samples": 0,
+    "subset_stats": [],
+    "prompt_length": {
+      "mean": 0,
+      "min": 0,
+      "max": 0,
+      "std": null
+    },
+    "target_length_mean": null,
+    "computed_at": "2026-09-18T17:17:15.861776"
+  },
+  "sample_example": {},
+  "readme": {
+    "en": "# ABC Coding\n\n\n## Overview\nABC Coding runs local repository development tasks through an OpenCode HTTP server. It consumes a local JSONL case index\nand preserves candidate code and session records. Optional local verification grades trusted repository tests.\n\n## Task Description\n- **Task Type**: Repository-level software development\n- **Input**: A task document and a checksummed initial source directory\n- **Output**: Candidate source archive, binary Git patch, session transcript, and execution metadata\n- **Domain**: Custom software engineering cases\n\n## Key Features\n- Uses the standard local dataset loader for selection, limits, and repeats.\n- Creates a fresh local Git baseline per attempt without exposing verifier files or solution history.\n- Uses HTTP session control rather than CLI prompt input or output parsing.\n- Preserves failures per case and supports serial batches with multiple repositories.\n- Supports verification-only replay and baseline calibration without calling a coding model.\n\n## Evaluation Notes\n- Requires Git, a configured OpenCode server, and the project's local toolchain.\n- OpenCode calls its configured provider directly; EvalScope's model bridge is not involved.\n- Use eval_type=mock_llm as an unused framework model placeholder and eval_batch_size=1.\n- Development-only runs exclude functional scores. Verification reports resolved, group pass rates, and evaluation coverage.\n- Verification uses fresh candidate copies, trusted overlays, declared commands, and Jest JSON or JUnit XML reports.\n- Incomplete evidence is unscored; failed assertions score zero. Local execution is not adversarial isolation.\n- Local execution is not a security sandbox. Pending permission/question requests stop the attempt for review.\n\n\n## Properties\n\n| Property | Value |\n|----------|-------|\n| **Benchmark Name** | `abc_coding` |\n| **Dataset ID** | `abc_coding` |\n| **Paper** | N/A |\n| **Tags** | `Agent`, `Coding`, `Custom` |\n| **Metrics** | `resolved`, `f2p_pass_rate`, `p2p_pass_rate`, `evaluation_coverage` |\n| **Default Shots** | 0-shot |\n| **Evaluation Split** | `test` |\n\n\n## Data Statistics\n\n*Statistics not available.*\n\n## Sample Example\n\n*Sample example not available.*\n\n## Prompt Template\n\n**Prompt Template:**\n```text\n{question}\n```\n\n## Extra Parameters\n\n| Parameter | Type | Default | Description |\n|-----------|------|---------|-------------|\n| `opencode` | `dict` | `{}` | OpenCodeHTTPConfig connection and policy. |\n| `coding` | `dict` | `{}` | CodingRunConfig mode and candidate directories. |\n\n## Usage\n\n### Using CLI\n\n```bash\nevalscope eval \\\n    --model YOUR_MODEL \\\n    --api-url OPENAI_API_COMPAT_URL \\\n    --api-key EMPTY_TOKEN \\\n    --datasets abc_coding \\\n    --limit 10  # Remove this line for formal evaluation\n```\n\n### Using Python\n\n```python\nfrom evalscope import run_task\nfrom evalscope.config import TaskConfig\n\ntask_cfg = TaskConfig(\n    model='YOUR_MODEL',\n    api_url='OPENAI_API_COMPAT_URL',\n    api_key='EMPTY_TOKEN',\n    datasets=['abc_coding'],\n    dataset_args={\n        'abc_coding': {\n            # extra_params: {}  # uses default extra parameters\n        }\n    },\n    limit=10,  # Remove this line for formal evaluation\n)\n\nrun_task(task_cfg=task_cfg)\n```\n\n\n",
+    "zh": "",
+    "content_hash": "b997b048a0a14731c577e711262f6369",
+    "needs_translation": true
+  },
+  "updated_at": "2026-09-18T17:17:15.862821"
+}

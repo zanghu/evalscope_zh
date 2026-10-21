@@ -1,0 +1,159 @@
+import { apiDeleteValidated, apiValidated } from './client'
+import type {
+  AnalysisResponse,
+  DataFrameResponse,
+  DeleteReportResponse,
+  ListReportsGroupedResponse,
+  ListReportsResponse,
+  LoadReportResponse,
+  PredictionsResponse,
+} from './types'
+import { parseReportRef } from '@/domain/report/reportRef'
+
+const BASE = '/api/v1/reports'
+
+/** Path to one model report resource: `/api/v1/reports/runs/{runId}/models/{modelId}`. */
+function reportPath(ref: string): string {
+  const { runId, modelId } = parseReportRef(ref)
+  return `${BASE}/runs/${encodeURIComponent(runId)}/models/${encodeURIComponent(modelId)}`
+}
+
+interface ListReportsParams {
+  rootPath: string
+  search?: string
+  models?: string[]
+  datasets?: string[]
+  sortBy?: 'model' | 'dataset' | 'time'
+  sortOrder?: 'asc' | 'desc'
+  page?: number
+  pageSize?: number
+  /** Optional signal to cancel a superseded list/search request. */
+  signal?: AbortSignal
+}
+
+export async function listReports(params: ListReportsParams): Promise<ListReportsResponse> {
+  return apiValidated<ListReportsResponse>(BASE, {
+    params: {
+      root_path: params.rootPath,
+      search: params.search,
+      models: params.models?.join(';'),
+      datasets: params.datasets?.join(';'),
+      sort_by: params.sortBy,
+      sort_order: params.sortOrder,
+      page: params.page,
+      page_size: params.pageSize,
+    },
+    signal: params.signal,
+  })
+}
+
+/**
+ * Same listing, rolled up into one row per model (see `ReportGroup`).
+ * Display-only: the backend never reads, writes, or merges a report to
+ * build a group - it's an in-memory rollup over metadata it already loads
+ * for the flat list, so every constituent report keeps its own identity.
+ */
+export async function listReportsGrouped(params: ListReportsParams): Promise<ListReportsGroupedResponse> {
+  return apiValidated<ListReportsGroupedResponse>(BASE, {
+    params: {
+      root_path: params.rootPath,
+      search: params.search,
+      models: params.models?.join(';'),
+      datasets: params.datasets?.join(';'),
+      sort_by: params.sortBy,
+      sort_order: params.sortOrder,
+      group_by: 'model',
+      page: params.page,
+      page_size: params.pageSize,
+    },
+    signal: params.signal,
+  })
+}
+
+export async function deleteReport(
+  rootPath: string,
+  ref: string,
+  signal?: AbortSignal,
+): Promise<DeleteReportResponse> {
+  return apiDeleteValidated<DeleteReportResponse>(reportPath(ref), {
+    params: { root_path: rootPath },
+    signal,
+  })
+}
+
+export async function loadReport(
+  rootPath: string,
+  ref: string,
+  signal?: AbortSignal,
+): Promise<LoadReportResponse> {
+  return apiValidated<LoadReportResponse>(reportPath(ref), {
+    params: { root_path: rootPath },
+    signal,
+  })
+}
+
+export async function getDataFrame(
+  rootPath: string,
+  ref: string,
+  view: 'acc' | 'compare' | 'dataset' = 'acc',
+  datasetName?: string,
+  signal?: AbortSignal,
+): Promise<DataFrameResponse> {
+  return apiValidated<DataFrameResponse>(`${reportPath(ref)}/table`, {
+    params: {
+      root_path: rootPath,
+      view,
+      dataset_name: datasetName,
+    },
+    signal,
+  })
+}
+
+export async function getPredictions(
+  rootPath: string,
+  ref: string,
+  datasetName: string,
+  subsetName: string,
+  signal?: AbortSignal,
+): Promise<PredictionsResponse> {
+  return apiValidated<PredictionsResponse>(`${reportPath(ref)}/predictions`, {
+    params: {
+      root_path: rootPath,
+      dataset_name: datasetName,
+      subset_name: subsetName,
+    },
+    signal,
+  })
+}
+
+export async function getAnalysis(
+  rootPath: string,
+  ref: string,
+  datasetName: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const res = await apiValidated<AnalysisResponse>(`${reportPath(ref)}/analysis`, {
+    params: {
+      root_path: rootPath,
+      dataset_name: datasetName,
+    },
+    signal,
+  })
+  return res.analysis
+}
+
+export function getHtmlReportUrl(rootPath: string, ref: string): string {
+  const { runId } = parseReportRef(ref)
+  return `${BASE}/runs/${encodeURIComponent(runId)}/html?root_path=${encodeURIComponent(rootPath)}`
+}
+
+/** URL of a multi-report comparison chart (`radar` | `grouped_bar`), one `report=` per reference. */
+export function getCompareChartUrl(
+  rootPath: string,
+  refs: string[],
+  chartType: 'radar' | 'grouped_bar',
+): string {
+  const params = new URLSearchParams({ root_path: rootPath })
+  for (const ref of refs) params.append('report', ref)
+  return `${BASE}/charts/${chartType}?${params.toString()}`
+}

@@ -1,0 +1,9 @@
+diffusers
+iopath
+lpips
+omegaconf
+open_clip_torch
+opencv-python
+peft>=0.17
+torch
+torchvision

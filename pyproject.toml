@@ -1,0 +1,138 @@
+[project]
+name = "evalscope"
+dynamic = ["version", "dependencies", "optional-dependencies"]
+description = "EvalScope: Lightweight LLMs Evaluation Framework"
+readme = {file = "README.md", content-type = "text/markdown"}
+license = "Apache-2.0"
+authors = [
+  {name = "ModelScope team"},
+  {email = "contact@modelscope.cn"}
+]
+keywords = ["python", "llm", "evaluation"]
+requires-python = ">=3.10"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/modelscope/evalscope"
+
+[project.scripts]
+evalscope = "evalscope.cli.cli:run_cmd"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"evalscope.web" = ["dist/**/*"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["evalscope*"]
+exclude = ["evalscope.web.node_modules*", "evalscope.web.src*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "evalscope.version.__version__"}
+dependencies = {file = ["requirements/framework.txt"]}
+
+[tool.setuptools.dynamic.optional-dependencies]
+opencompass      = {file = ["requirements/opencompass.txt"]}
+vlmeval          = {file = ["requirements/vlmeval.txt"]}
+rag              = {file = ["requirements/rag.txt"]}
+perf             = {file = ["requirements/perf.txt"]}
+agentx           = {file = ["requirements/perf.txt", "requirements/agentx.txt"]}
+app              = {file = ["requirements/app.txt"]}
+aigc             = {file = ["requirements/aigc.txt"]}
+sandbox          = {file = ["requirements/sandbox.txt"]}
+service          = {file = ["requirements/service.txt", "requirements/perf.txt"]}
+mcp              = {file = ["requirements/mcp.txt"]}
+dev              = {file = ["requirements/dev.txt"]}
+docs             = {file = ["requirements/docs.txt"]}
+
+ocr_bench        = {file = ["evalscope/benchmarks/ocr_bench/requirements.txt"]}
+cc_ocr_v2        = {file = ["evalscope/benchmarks/cc_ocr_v2/requirements.txt"]}
+omnidoc_bench    = {file = ["evalscope/benchmarks/omnidoc_bench/legacy/requirements.txt"]}
+olmocr_bench     = {file = ["evalscope/benchmarks/olmocr_bench/requirements.txt"]}
+maritime_ocr_bench = {file = ["evalscope/benchmarks/maritime_ocr_bench/requirements.txt"]}
+miniwob          = {file = ["evalscope/benchmarks/miniwob/requirements.txt"]}
+ifeval           = {file = ["evalscope/benchmarks/ifeval/requirements.txt"]}
+ifbench          = {file = ["evalscope/benchmarks/ifbench/requirements.txt"]}
+multi_if         = {file = ["evalscope/benchmarks/multi_if/requirements.txt"]}
+olympiad_bench   = {file = ["evalscope/benchmarks/olympiad_bench/requirements.txt"]}
+needle_haystack  = {file = ["evalscope/benchmarks/needle_haystack/requirements.txt"]}
+openai_mrcr      = {file = ["evalscope/benchmarks/openai_mrcr/requirements.txt"]}
+general_arena    = {file = ["evalscope/benchmarks/general_arena/requirements.txt"]}
+arena_hard       = {file = ["evalscope/benchmarks/arena_hard/requirements.txt"]}
+air_bench        = {file = ["evalscope/benchmarks/air_bench/requirements.txt"]}
+caption          = {file = ["evalscope/benchmarks/caption/requirements.txt"]}
+refcoco          = {file = ["evalscope/benchmarks/refcoco/requirements.txt"]}
+swe_bench        = {file = ["evalscope/benchmarks/swe_bench/requirements.txt"]}
+wmt              = {file = ["evalscope/benchmarks/wmt/requirements.txt"]}
+torgo            = {file = ["evalscope/benchmarks/torgo/requirements.txt"]}
+terminal_bench   = {file = ["evalscope/benchmarks/terminal_bench/requirements.txt"]}
+deep_swe         = {file = ["evalscope/benchmarks/deep_swe/requirements.txt"]}
+toolathlon       = {file = ["evalscope/benchmarks/toolathlon/requirements.txt"]}
+bfcl             = {file = ["evalscope/benchmarks/bfcl/requirements.txt"]}
+wide_search      = {file = ["evalscope/benchmarks/wide_search/requirements.txt"]}
+vtcbench         = {file = ["evalscope/benchmarks/vtcbench/requirements.txt"]}
+all = {file = [
+  "requirements/opencompass.txt",
+  "requirements/vlmeval.txt",
+  "requirements/rag.txt",
+  "requirements/perf.txt",
+  "requirements/app.txt",
+  "requirements/aigc.txt",
+  "requirements/service.txt"
+]}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["*test*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-s -v"
+
+[tool.ruff]
+include = [
+  "pyproject.toml",
+  "*.py",
+  "evalscope/**/*.py",
+  "scripts/release/**/*.py",
+  "tests/**/*.py",
+]
+extend-exclude = [
+  "docs",
+  "examples",
+  "evalscope/utils/utils.py",
+  "evalscope/third_party",
+  "evalscope/backend/rag_eval/clip_benchmark/tasks",
+  "evalscope/backend/rag_eval/cmteb/tasks",
+  "evalscope/metrics/vision/t2v_metrics",
+]
+force-exclude = true
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["E402"]
+"__init__.py" = ["F401"]
+"!evalscope/{utils,cli,report}/**/*.py" = ["F401"]
+
+[tool.ruff.format]
+exclude = ["tests/**/*.py"]
+indent-style = "space"
+line-ending = "lf"
+quote-style = "single"
